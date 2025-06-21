@@ -1,0 +1,997 @@
+//#![allow(unused_imports)]
+//#![allow(dead_code)]
+//#![allow(unused_variables)]
+//#![allow(unused_mut)]
+//#![allow(deprecated)]
+
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::alloc::{alloc, dealloc, Layout};
+use std::ptr::NonNull;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use rand::{Rng, SeedableRng};
+use rand::rngs::SmallRng;
+use tokio::sync::Mutex;
+use tokio::time::interval;
+use serde::{Deserialize, Serialize};
+use syslog::{BasicLogger, Facility, Formatter3164};
+use log::{LevelFilter, info, warn, error};
+use lettre::{Message, SmtpTransport, Transport};
+use lettre::transport::smtp::authentication::Credentials;
+use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use std::fs;
+
+use disk_patrol::{ConfigBuilder, generate_example_config, SECTOR_SIZE, DEFAULT_CONFIG_PATH};
+use disk_patrol::PatrolConfig;
+use disk_patrol::verify_config_paths;
+use disk_patrol::config::build_cli;
+
+/// Single aligned buffer for O_DIRECT I/O operations shared across all devices
+struct SharedBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+    size: usize,
+}
+
+impl SharedBuffer {
+    /// Create a new aligned buffer suitable for O_DIRECT
+    fn new(size: usize, alignment: usize) -> Result<Self, std::io::Error> {
+        // Round up size to alignment boundary
+        let aligned_size = ((size + alignment - 1) / alignment) * alignment;
+
+        let layout = Layout::from_size_align(aligned_size, alignment)
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Invalid buffer layout: {}", e)
+            ))?;
+
+        let ptr = unsafe { alloc(layout) };
+
+        if ptr.is_null() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "Failed to allocate aligned buffer"
+            ));
+        }
+
+        Ok(SharedBuffer {
+            ptr: NonNull::new(ptr).unwrap(),
+            layout,
+            size: aligned_size,
+        })
+    }
+
+    /// Get a mutable slice to the buffer
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.size) }
+    }
+
+    /// Get the buffer size
+    fn len(&self) -> usize {
+        self.size
+    }
+}
+
+impl Drop for SharedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+// Make it Send + Sync for sharing across tasks
+unsafe impl Send for SharedBuffer {}
+unsafe impl Sync for SharedBuffer {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeviceInfo {
+    path: PathBuf,
+    size_bytes: u64,
+    sectors: u64,
+    last_position: u64,
+    errors: Vec<PatrolError>,
+    reported_errors: usize,
+    patrol_start: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PatrolError {
+    timestamp: u64,
+    sector: u64,
+    error: String,
+}
+
+struct Logger {
+    config: PatrolConfig,
+    progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+    multi_progress: Arc<MultiProgress>,
+}
+
+struct PatrolReader {
+    config: PatrolConfig,
+    device_states: Arc<Mutex<HashMap<PathBuf, DeviceInfo>>>,
+    logger: Arc<Logger>,
+    shared_buffer: Arc<Mutex<SharedBuffer>>,  // Single shared buffer
+}
+
+impl Logger {
+    fn new(config: PatrolConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(ref path) = config.log_file {
+            match simple_logging::log_to_file(path, LevelFilter::Info) {
+                Err(e) => { panic!("cannot log to {} - {}", path.display(), e); },
+                Ok(_) => { info!("logging to {}", path.display()); },
+            }
+        } else if config.use_syslog {
+            let facility = match config.syslog_facility.as_str() {
+                "daemon" => Facility::LOG_DAEMON,
+                "user" => Facility::LOG_USER,
+                "local0" => Facility::LOG_LOCAL0,
+                "local1" => Facility::LOG_LOCAL1,
+                "local2" => Facility::LOG_LOCAL2,
+                "local3" => Facility::LOG_LOCAL3,
+                "local4" => Facility::LOG_LOCAL4,
+                "local5" => Facility::LOG_LOCAL5,
+                "local6" => Facility::LOG_LOCAL6,
+                "local7" => Facility::LOG_LOCAL7,
+                _ => Facility::LOG_DAEMON,
+            };
+
+            let formatter = Formatter3164 {
+                facility,
+                hostname: None,
+                process: "disk_patrol".into(),
+                pid: std::process::id(),
+            };
+
+            let logger = match syslog::unix(formatter) {
+                Err(e) => { panic!("impossible to connect to syslog: {:?}", e); },
+                Ok(logger) => logger,
+            };
+            log::set_boxed_logger(Box::new(BasicLogger::new(logger)))
+                .map(|()| log::set_max_level(LevelFilter::Info))?;
+        }
+
+        Ok(Logger {
+            config,
+            progress_bars: Arc::new(Mutex::new(HashMap::new())),
+            multi_progress: Arc::new(MultiProgress::new()),
+        })
+    }
+
+    fn log_info(&self, message: &str) {
+        if self.config.verbose {
+            //println!("INFO: {}", message);
+        }
+
+        info!("{}", message);
+    }
+
+    fn log_error(&self, message: &str) {
+        eprintln!("ERROR: {}", message);
+
+        error!("{}", message);
+    }
+
+    fn log_warning(&self, message: &str) {
+        if self.config.verbose {
+            println!("WARNING: {}", message);
+        }
+
+        warn!("{}", message);
+    }
+
+    async fn send_email_alert(&self, subject: &str, body: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !self.config.email_alerts {
+            return Ok(());
+        }
+
+        let smtp_server = self.config.smtp_server.as_ref()
+            .ok_or("SMTP server not configured")?;
+        let from_addr = self.config.alert_from.as_ref()
+            .ok_or("Alert from address not configured")?;
+
+        if self.config.alert_to.is_empty() {
+            return Err("No alert recipients configured".into());
+        }
+
+        for to_addr in &self.config.alert_to {
+            let email = Message::builder()
+                .from(from_addr.parse()?)
+                .to(to_addr.parse()?)
+                .subject(subject)
+                .body(body.to_string())?;
+
+            let mut mailer_builder = if self.config.smtp_use_starttls {
+                SmtpTransport::starttls_relay(smtp_server)?
+            } else {
+                SmtpTransport::builder_dangerous(smtp_server)
+            };
+
+            // Configure authentication only if credentials are provided
+            if let (Some(username), Some(password)) = (
+                &self.config.smtp_username,
+                &self.config.smtp_password
+            ) {
+                if username.len() > 0 {
+                    let creds = Credentials::new(username.clone(), password.clone());
+                    mailer_builder = mailer_builder.credentials(creds);
+                }
+            }
+
+            // Configure STARTTLS and port
+            let mailer = mailer_builder
+                .port(self.config.smtp_port)
+                .build();
+
+            match mailer.send(&email) {
+                Ok(_) => self.log_info(&format!("Alert email sent to {}", to_addr)),
+                Err(e) => {
+                    self.log_error(&format!("Failed to send email to {}: {}", to_addr, e));
+                    if self.config.verbose {
+                        self.log_error(&format!("SMTP Debug: server={:?}, port={}, starttls={}, auth={}",
+                                               self.config.smtp_server, self.config.smtp_port,
+                                               self.config.smtp_use_starttls,
+                                               self.config.smtp_username.is_some()));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn progress_msg(&self, pb: &ProgressBar, device_path: &Path, device_info: &DeviceInfo, msg: String) {
+        let device_name = device_path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let size_tb = device_info.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0);
+        let error_cnt = device_info.errors.len();
+        if error_cnt > 0 {
+            pb.set_message(format!("{:5.1}TB {:8} ❌ {} ({} errors)", size_tb, device_name, msg, error_cnt));
+        } else {
+            pb.set_message(format!("{:5.1}TB {:8} - {}", size_tb, device_name, msg));
+        }
+        pb.set_position(device_info.last_position / SECTOR_SIZE);
+    }
+
+    async fn create_progress_bar(&self, device_path: &Path, device_info: &DeviceInfo) {
+        let pb = self.multi_progress.add(ProgressBar::new(device_info.sectors));
+
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] {bar:20.cyan/blue} {msg}")
+                .unwrap()
+                .progress_chars("█▉▊▋▌▍▎▏  ")
+        );
+
+        self.progress_msg(&pb, device_path, device_info, format!("- Starting patrol"));
+        // let device_name = device_path.file_name()
+        //     .unwrap_or_default()
+        //     .to_string_lossy()
+        //     .to_string();
+
+        // let size_tb = device_info.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0);
+        // pb.set_message(format!("{:5.1}TB {:8} - Starting patrol", size_tb, device_name));
+        // pb.set_position(device_info.last_position / SECTOR_SIZE);
+
+        let mut progress_bars = self.progress_bars.lock().await;
+        progress_bars.insert(device_path.to_path_buf(), pb);
+    }
+}
+
+impl PatrolReader {
+    fn new(config: PatrolConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let logger = Arc::new(Logger::new(config.clone())?);
+
+        // Create the single shared buffer
+        let buffer_size = config.read_size as usize;
+        let alignment = 4 * 1024;
+        let shared_buffer = Arc::new(Mutex::new(SharedBuffer::new(buffer_size, alignment)?));
+
+        logger.log_info(&format!(
+            "Created shared buffer: {} bytes ({}KB) with {} byte alignment",
+            buffer_size,
+            buffer_size / 1024,
+            alignment
+        ));
+
+        Ok(Self {
+            config,
+            device_states: Arc::new(Mutex::new(HashMap::new())),
+            logger,
+            shared_buffer,
+        })
+    }
+
+    async fn initialize(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut states = self.device_states.lock().await;
+
+        // Load existing state if available
+        if self.config.state_file.exists() {
+            match self.load_state().await {
+                Ok(loaded_states) => {
+                    *states = loaded_states;
+                    self.logger.log_info(&format!("Loaded patrol state from {:?}", self.config.state_file));
+                }
+                Err(e) => {
+                    self.logger.log_warning(&format!("Could not load state file: {}", e));
+                }
+            }
+        }
+
+        // Initialize new devices
+        for device_path in &self.config.devices {
+            if !states.contains_key(device_path) {
+                match self.get_device_info(device_path).await {
+                    Ok(info) => {
+                        self.logger.log_info(&format!("Initialized device: {:?} ({}TB)",
+                                device_path, info.size_bytes / (1024 * 1024 * 1024 * 1024)));
+
+                        // Create progress bar for this device
+                        if self.config.show_progress {
+                            self.logger.create_progress_bar(device_path, &info).await;
+                        }
+
+                        states.insert(device_path.clone(), info);
+                    }
+                    Err(e) => {
+                        self.logger.log_error(&format!("Error initializing device {:?}: {}", device_path, e));
+                        return Err(e);
+                    }
+                }
+            } else if self.config.show_progress {
+                // Device exists, create progress bar
+                if let Some(info) = states.get(device_path) {
+                    self.logger.create_progress_bar(device_path, info).await;
+                }
+            }
+        }
+
+        self.save_state(&states).await?;
+        Ok(())
+    }
+
+    async fn get_device_info(&self, device_path: &Path) -> Result<DeviceInfo, Box<dyn std::error::Error + Send + Sync>> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(device_path)?;
+
+        // Get device size
+        file.seek(SeekFrom::End(0))?;
+        let size_bytes = file.stream_position()?;
+        let sectors = size_bytes / SECTOR_SIZE;
+
+        Ok(DeviceInfo {
+            path: device_path.to_path_buf(),
+            size_bytes,
+            sectors,
+            last_position: 0,
+            errors: Vec::new(),
+            reported_errors: 0,
+            patrol_start: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        })
+    }
+
+
+    /// Enhanced device patrol using shared buffer
+    async fn patrol_device_with_shared_buffer(
+        device_states: Arc<Mutex<HashMap<PathBuf, DeviceInfo>>>,
+        config: PatrolConfig,
+        logger: Arc<Logger>,
+        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        shared_buffer: Arc<Mutex<SharedBuffer>>,
+        device_path: PathBuf,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
+        let (read_position, device_size) = {
+            let states = device_states.lock().await;
+            let device_info = match states.get(&device_path) {
+                Some(info) => info,
+                None => return Ok(()), // Device removed
+            };
+            (device_info.last_position, device_info.size_bytes)
+        };
+
+        // Perform the read with the shared buffer
+        match Self::read_device_chunk_with_shared_buffer(
+            &device_path,
+            read_position,
+            config.read_size,
+            shared_buffer
+        ).await {
+            Ok(_) => {
+                // Successful read - update state and progress
+                Self::update_device_state_after_read(
+                    device_states,
+                    &device_path,
+                    device_size,
+                    &config,
+                    &logger,
+                    progress_bars,
+                    read_position,
+                ).await?;
+
+                if config.verbose {
+                    let sector_start = read_position / SECTOR_SIZE;
+                    let sector_end = (read_position + config.read_size - 1) / SECTOR_SIZE;
+                    logger.log_info(&format!("✓ Read sectors {:x}-{:x} from {:?}",
+                                           sector_start, sector_end, device_path));
+                }
+            }
+            Err(e) => {
+                // Handle read error
+                Self::handle_read_error(
+                    device_states,
+                    &device_path,
+                    device_size,
+                    &config,
+                    &logger,
+                    progress_bars,
+                    read_position,
+                    e,
+                ).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update device state after successful read (same as before)
+    async fn update_device_state_after_read(
+        device_states: Arc<Mutex<HashMap<PathBuf, DeviceInfo>>>,
+        device_path: &PathBuf,
+        device_size: u64,
+        config: &PatrolConfig,
+        logger: &Arc<Logger>,
+        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        _read_position: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut states = device_states.lock().await;
+        if let Some(device_info) = states.get_mut(device_path) {
+            device_info.last_position += config.read_size;
+
+            // Update progress bar
+            if config.show_progress {
+                let progress_bars = progress_bars.lock().await;
+                if let Some(pb) = progress_bars.get(device_path) {
+                    let progress_pct = (device_info.last_position as f64 / device_size as f64) * 100.0;
+                    logger.progress_msg(&pb, device_path, device_info, format!("{:4.1}%", progress_pct));
+                }
+            }
+
+            // Check if patrol cycle is complete
+            if device_info.last_position >= device_size {
+                device_info.last_position = 0;
+                device_info.patrol_start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+                logger.log_info(&format!("✅ Completed full patrol of {:?}, restarting cycle", device_path));
+
+                // Reset progress bar
+                if config.show_progress {
+                    let progress_bars = progress_bars.lock().await;
+                    if let Some(pb) = progress_bars.get(device_path) {
+                        pb.set_position(0);
+                        logger.progress_msg(&pb, device_path, device_info, format!("Cycle complete! Restarting..."));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle read errors (same as before)
+    async fn handle_read_error(
+        device_states: Arc<Mutex<HashMap<PathBuf, DeviceInfo>>>,
+        device_path: &PathBuf,
+        _device_size: u64,
+        config: &PatrolConfig,
+        logger: &Arc<Logger>,
+        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        read_position: u64,
+        error: std::io::Error,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let error_msg = format!("I/O Error reading {:?} at sector {:x}: {}",
+                               device_path, read_position / SECTOR_SIZE, error);
+        logger.log_error(&error_msg);
+
+        // Record error in device state
+        let mut states = device_states.lock().await;
+        if let Some(device_info) = states.get_mut(device_path) {
+            device_info.errors.push(PatrolError {
+                timestamp: now,
+                sector: read_position / SECTOR_SIZE,
+                error: error.to_string(),
+            });
+
+            // Update progress bar with error indicator
+            if config.show_progress {
+                let progress_bars = progress_bars.lock().await;
+                if let Some(pb) = progress_bars.get(device_path) {
+                    logger.progress_msg(&pb, device_path, device_info,
+                                      format!("❌ {} errors total", device_info.errors.len()));
+                }
+            }
+
+            // Still advance position to avoid getting stuck
+            device_info.last_position += config.read_size;
+        }
+        Ok(())
+    }
+
+    /// Read device chunk using the single shared buffer
+    async fn read_device_chunk_with_shared_buffer(
+        device_path: &Path,
+        position: u64,
+        size: u64,
+        shared_buffer: Arc<Mutex<SharedBuffer>>,
+    ) -> Result<(), std::io::Error> {
+        let device_path = device_path.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            // Acquire the shared buffer lock - this is where serialization happens
+            let rt = tokio::runtime::Handle::current();
+            let mut buffer = rt.block_on(shared_buffer.lock());
+
+            if buffer.len() < size as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Buffer size {} too small for read size {}", buffer.len(), size)
+                ));
+            }
+
+            // Open device with O_DIRECT
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&device_path)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to open device '{}': {}", device_path.display(), e)
+                    )
+                })?;
+
+            // Seek to position
+            file.seek(SeekFrom::Start(position))
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to seek to position {}: {}", position, e)
+                    )
+                })?;
+
+            // Read into the shared buffer
+            let buffer_slice = buffer.as_mut_slice();
+            let bytes_read = file.read(&mut buffer_slice[..size as usize])
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read {} bytes at position {}: {}", size, position, e)
+                    )
+                })?;
+
+            // Verify we read the expected amount
+            if bytes_read < size as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("Expected to read {} bytes, but only read {}", size, bytes_read)
+                ));
+            }
+
+            // Note: We don't need to copy data out since we're just checking for read errors
+            // The buffer content is discarded after this operation
+            Ok(())
+        }).await.unwrap()
+    }
+
+    async fn load_state(&self) -> Result<HashMap<PathBuf, DeviceInfo>, Box<dyn std::error::Error + Send + Sync>> {
+        let content = tokio::fs::read_to_string(&self.config.state_file).await?;
+        let states: HashMap<PathBuf, DeviceInfo> = serde_json::from_str(&content)?;
+        Ok(states)
+    }
+
+    async fn save_state(&self, states: &HashMap<PathBuf, DeviceInfo>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let content = serde_json::to_string_pretty(states)?;
+        tokio::fs::write(&self.config.state_file, content).await?;
+        Ok(())
+    }
+
+    async fn print_status(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let states = self.device_states.lock().await;
+
+        println!("\nDisk Patrol Status:");
+        println!("{:-<80}", "");
+
+        for (path, info) in states.iter() {
+            let progress = (info.last_position as f64 / info.size_bytes as f64) * 100.0;
+            let error_count = info.errors.len();
+
+            println!("Device: {:?}", path);
+            println!("  Size: {:.2} GB", info.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+            println!("  Progress: {:.1}%", progress);
+            println!("  Errors: {}", error_count);
+
+            if error_count > 0 {
+                println!("  Recent errors:");
+                for error in info.errors.iter().rev().take(3) {
+                    println!("    Sector {:x}: {}", error.sector, error.error);
+                }
+            }
+            println!();
+        }
+
+        Ok(())
+    }
+
+    /// Enhanced single device patrol using shared buffer with jitter
+    async fn run_single_device_patrol_with_shared_buffer(
+        device_path: PathBuf,
+        device_states: Arc<Mutex<HashMap<PathBuf, DeviceInfo>>>,
+        config: PatrolConfig,
+        logger: Arc<Logger>,
+        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        shared_buffer: Arc<Mutex<SharedBuffer>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
+        // Get device size and calculate optimal interval
+        let device_size = {
+            let states = device_states.lock().await;
+            states.get(&device_path)
+                .map(|info| info.size_bytes)
+                .ok_or_else(|| format!("Device {:?} not found in state", device_path))?
+        };
+
+        let patrol_period_ms = 1000 * (config.patrol_period_days * 24 * 3600);
+        let total_reads = (device_size + config.read_size - 1) / config.read_size;
+        let optimal_sleep_ms = (patrol_period_ms / total_reads.max(1)).max(1);
+
+        let jitter_info = if config.enable_jitter {
+            format!(" (±{}% jitter)", config.max_jitter_percent)
+        } else {
+            String::new()
+        };
+
+        logger.log_info(&format!(
+            "Device {:?}: {} reads over {}d = {}ms intervals{} (using shared buffer)",
+            device_path,
+            total_reads,
+            config.patrol_period_days,
+            optimal_sleep_ms,
+            jitter_info
+        ));
+
+        // Create a Send-safe RNG seeded from entropy
+        //let mut rng = StdRng::from_entropy();
+        let mut rng = SmallRng::from_entropy();
+
+        loop {
+            let start_time = tokio::time::Instant::now();
+
+            // Calculate jittered timing for this iteration
+            let (pre_sleep_ms, post_sleep_ms) = if config.enable_jitter {
+                Self::calculate_jittered_timing(optimal_sleep_ms, config.max_jitter_percent, &mut rng)
+            } else {
+                (0, optimal_sleep_ms)
+            };
+
+            // Random pre-sleep (jitter the start time)
+            if pre_sleep_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(pre_sleep_ms)).await;
+            }
+
+            // Perform the I/O operation
+            let io_start = tokio::time::Instant::now();
+            if let Err(e) = Self::patrol_device_with_shared_buffer(
+                device_states.clone(),
+                config.clone(),
+                logger.clone(),
+                progress_bars.clone(),
+                shared_buffer.clone(),
+                device_path.clone(),
+            ).await {
+                logger.log_error(&format!("Error patrolling {:?}: {}", device_path, e));
+            }
+            let io_duration = io_start.elapsed();
+
+            // Calculate remaining sleep time, accounting for actual I/O duration
+            let total_elapsed = start_time.elapsed().as_millis() as u64;
+            let target_total_time = if config.enable_jitter {
+                pre_sleep_ms + post_sleep_ms
+            } else {
+                optimal_sleep_ms
+            };
+
+            if total_elapsed < target_total_time {
+                let remaining_sleep = target_total_time - total_elapsed;
+                tokio::time::sleep(Duration::from_millis(remaining_sleep)).await;
+            }
+
+            if config.verbose && config.enable_jitter {
+                logger.log_info(&format!(
+                    "Device {:?}: pre={}ms, I/O={}ms, post={}ms, total={}ms",
+                    device_path.file_name().unwrap_or_default().to_string_lossy(),
+                    pre_sleep_ms,
+                    io_duration.as_millis(),
+                    if total_elapsed < target_total_time { target_total_time - total_elapsed } else { 0 },
+                    start_time.elapsed().as_millis()
+                ));
+            }
+        }
+    }
+
+    /// Calculate jittered timing: split the interval into random pre-sleep + post-sleep
+    fn calculate_jittered_timing(
+        base_interval_ms: u64,
+        max_jitter_percent: u8,
+        rng: &mut impl Rng
+    ) -> (u64, u64) {
+        let max_jitter_percent = max_jitter_percent.min(100) as f64 / 100.0;
+        let max_jitter_ms = (base_interval_ms as f64 * max_jitter_percent) as u64;
+
+        // Random jitter from 0 to max_jitter_ms
+        let total_jitter = rng.gen_range(0..=max_jitter_ms);
+
+        // Split the jitter randomly between pre and post
+        let pre_jitter = rng.gen_range(0..=total_jitter);
+        let post_jitter = total_jitter - pre_jitter;
+
+        // Base timing: start with some delay, then I/O, then remaining sleep
+        let base_post_sleep = base_interval_ms.saturating_sub(total_jitter);
+
+        (pre_jitter, base_post_sleep + post_jitter)
+    }
+
+    /// Enhanced per-device patrol with shared buffer
+    async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.logger.log_info(&format!(
+            "Starting per-device patrol with {} devices using shared {}KB buffer",
+            self.config.devices.len(),
+            self.config.read_size / 1024
+        ));
+
+        // Spawn individual patrol tasks for each device
+        let mut handles = Vec::new();
+
+        for device_path in &self.config.devices {
+            let device_path_clone = device_path.clone();
+            let device_states_clone = self.device_states.clone();
+            let config_clone = self.config.clone();
+            let logger_clone = self.logger.clone();
+            let progress_bars_clone = self.logger.progress_bars.clone();
+            let shared_buffer_clone = self.shared_buffer.clone();
+
+            let handle = tokio::spawn(async move {
+                Self::run_single_device_patrol_with_shared_buffer(
+                    device_path_clone,
+                    device_states_clone,
+                    config_clone,
+                    logger_clone,
+                    progress_bars_clone,
+                    shared_buffer_clone,
+                ).await
+            });
+
+            handles.push(handle);
+        }
+
+        // Spawn periodic maintenance tasks
+        let _state_saver_handle = self.spawn_periodic_tasks().await;
+        // handles.push(state_saver_handle);
+
+        // Wait for all device patrols (they run forever)
+        for handle in handles {
+            if let Err(e) = handle.await {
+                self.logger.log_error(&format!("Device patrol task failed: {}", e));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Spawn periodic maintenance tasks (state saving, error checking)
+    async fn spawn_periodic_tasks(&self) -> tokio::task::JoinHandle<()> {
+        let device_states = self.device_states.clone();
+        let config = self.config.clone();
+        let logger = self.logger.clone();
+
+        tokio::spawn(async move {
+            let mut save_interval = interval(Duration::from_secs(60)); // Save state every minute
+            let mut alert_interval = interval(Duration::from_secs(300)); // Check alerts every 5 minutes
+
+            loop {
+                tokio::select! {
+                    _ = save_interval.tick() => {
+                        // Periodic state save
+                        let states = device_states.lock().await;
+                        if let Err(e) = Self::save_state_to_file(&config.state_file, &states).await {
+                            logger.log_error(&format!("Failed to save state: {}", e));
+                        }
+                    }
+
+                    _ = alert_interval.tick() => {
+                        // Periodic error threshold checking
+                        if let Err(e) = Self::check_error_alerts_static(
+                            device_states.clone(),
+                            config.clone(),
+                            logger.clone(),
+                        ).await {
+                            logger.log_error(&format!("Error checking alerts: {}", e));
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Static version of check_error_alerts for use in spawned tasks
+    async fn check_error_alerts_static(
+        device_states: Arc<Mutex<HashMap<PathBuf, DeviceInfo>>>,
+        config: PatrolConfig,
+        logger: Arc<Logger>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut states = device_states.lock().await;
+
+        for (device_path, device_info) in states.iter_mut() {
+            if device_info.errors.len() - device_info.reported_errors >= config.error_threshold {
+                device_info.reported_errors = device_info.errors.len();
+
+                let subject = format!("Disk Patrol Alert: {} errors on {:?}",
+                                    device_info.errors.len(), device_path);
+
+                let mut body = format!("Device: {:?}\n", device_path);
+                body.push_str(&format!("Total errors: {}\n\n", device_info.errors.len()));
+                body.push_str("Recent errors:\n");
+
+                for error in device_info.errors.iter().rev().take(10) {
+                    let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(error.timestamp);
+                    body.push_str(&format!("  {:?} - Sector {:x}: {}\n",
+                                           timestamp, error.sector, error.error));
+                }
+
+                logger.send_email_alert(&subject, &body).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper method for saving state (static version)
+    async fn save_state_to_file(
+        state_file: &PathBuf,
+        states: &HashMap<PathBuf, DeviceInfo>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let content = serde_json::to_string_pretty(states)?;
+        tokio::fs::write(state_file, content).await?;
+        Ok(())
+    }
+    /// Reset device state (for --reset option)
+    async fn reset_device_state(&self, reset_all: bool, specific_devices: &[PathBuf]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut states = self.device_states.lock().await;
+
+        if reset_all {
+            self.logger.log_info("Resetting all device states");
+            states.clear();
+        } else {
+            for device_path in specific_devices {
+                if states.remove(device_path).is_some() {
+                    self.logger.log_info(&format!("Reset state for device: {:?}", device_path));
+                } else {
+                    self.logger.log_warning(&format!("Device not found in state: {:?}", device_path));
+                }
+            }
+        }
+
+        // Re-initialize devices
+        for device_path in &self.config.devices {
+            if !states.contains_key(device_path) {
+                match self.get_device_info(device_path).await {
+                    Ok(info) => {
+                        self.logger.log_info(&format!("Re-initialized device: {:?} ({}TB)",
+                                device_path, info.size_bytes / (1024 * 1024 * 1024 * 1024)));
+                        states.insert(device_path.clone(), info);
+                    }
+                    Err(e) => {
+                        self.logger.log_error(&format!("Error re-initializing device {:?}: {}", device_path, e));
+                    }
+                }
+            }
+        }
+
+        self.save_state(&states).await?;
+        self.logger.log_info("Device state reset complete");
+        Ok(())
+    }
+
+}
+
+// Helper function to parse buffer size with KB/MB units
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let matches = build_cli().get_matches();
+
+    // Handle config file generation
+    if let Some(config_path) = matches.get_one::<String>("generate-config") {
+        let example_config = generate_example_config()?;
+        fs::write(config_path, example_config)?;
+        println!("Generated example configuration file: {}", config_path);
+        println!("\nEdit the file and run with: disk_patrol --config {}", config_path);
+        return Ok(());
+    }
+
+    // Build configuration from config file + command line
+    let mut config_builder = ConfigBuilder::new();
+
+    if let Some(config_path) = matches.get_one::<String>("config") {
+        config_builder = config_builder.load_config_file(config_path)
+            .map_err(|e| format!("Failed to load config file '{}': {}", config_path, e))?;
+        println!("Loaded configuration from: {}", config_path);
+    }
+
+    let config = config_builder
+        .merge_command_line(&matches)
+        .build()?;
+
+    verify_config_paths(&config)?;
+
+    // Validate jitter percentage
+    if config.max_jitter_percent > 100 {
+        return Err("Jitter percentage cannot exceed 100%".into());
+    }
+
+    if matches.get_flag("merge-config") {
+        let path = if let Some(config_path) = matches.get_one::<String>("config") {
+            config_path
+        } else {
+            &DEFAULT_CONFIG_PATH.to_string()
+        };
+        let config_builder = ConfigBuilder::new();
+        config_builder.merge_command_line(&matches).save_config_file(path)?;
+        return Ok(());
+    }
+
+    let patrol_reader = PatrolReader::new(config)?;
+
+    if matches.get_flag("test-email") {
+        let subject = format!("test email");
+        let body    = format!("test email");
+        patrol_reader.logger.send_email_alert(&subject, &body).await?;
+        return Ok(());
+    }
+
+    // Handle reset operations
+    if matches.get_flag("reset-all") {
+        patrol_reader.reset_device_state(true, &[]).await?;
+        println!("All device states have been reset.");
+        return Ok(());
+    }
+
+    if matches.get_flag("reset") {
+        let devices_to_reset: Vec<PathBuf> = if let Some(devices) = matches.get_many::<String>("devices") {
+            devices.map(|s| PathBuf::from(s)).collect()
+        } else {
+            patrol_reader.config.devices.clone()
+        };
+        patrol_reader.reset_device_state(false, &devices_to_reset).await?;
+        println!("Reset state for {} device(s).", devices_to_reset.len());
+        return Ok(());
+    }
+
+    // Initialize normally
+    patrol_reader.initialize().await?;
+
+    if matches.get_flag("status") {
+        patrol_reader.print_status().await?;
+    } else {
+        patrol_reader.run().await?;
+    }
+
+    Ok(())
+}
