@@ -90,17 +90,17 @@ impl Drop for SharedBuffer {
 unsafe impl Send for SharedBuffer {}
 unsafe impl Sync for SharedBuffer {}
 
-struct Logger {
-    config: PatrolConfig,
-    progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
-    multi_progress: Arc<MultiProgress>,
-}
-
 struct PatrolReader {
     config: PatrolConfig,
     device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
     logger: Arc<Logger>,
     shared_buffer: Arc<Mutex<SharedBuffer>>,  // Single shared buffer
+}
+
+struct Logger {
+    config: PatrolConfig,
+    progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+    multi_progress: Arc<MultiProgress>,
 }
 
 impl Logger {
@@ -454,50 +454,6 @@ impl PatrolReader {
 
         Ok(())
     }
-    // async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    //     // Spawn individual patrol tasks for each device
-    //     let mut handles = Vec::new();
-    //     let mut states = self.device_states.lock().await;
-
-    //     for (uniq, info) in states.iter_mut() {
-    //         let uniq_clone = uniq.clone();
-    //         let device_path = &info.path;
-    //         let device_path_clone = device_path.clone();
-    //         let device_states_clone = self.device_states.clone();
-    //         let config_clone = self.config.clone();
-    //         let logger_clone = self.logger.clone();
-    //         let progress_bars_clone = self.logger.progress_bars.clone();
-    //         let shared_buffer_clone = self.shared_buffer.clone();
-
-    //         let handle = tokio::spawn(async move {
-    //             Self::run_single(
-    //                 uniq_clone,
-    //                 device_path_clone,
-    //                 info.size_bytes,
-    //                 info.last_position,
-    //                 device_states_clone,
-    //                 config_clone,
-    //                 logger_clone,
-    //                 progress_bars_clone,
-    //                 shared_buffer_clone,
-    //             ).await
-    //         });
-
-    //         handles.push(handle);
-    //     }
-
-    //     // Spawn periodic maintenance tasks
-    //     let _state_saver_handle = self.spawn_periodic_tasks().await;
-    //     // handles.push(state_saver_handle);
-
-    //     // Wait for all device patrols (they run forever)
-    //     for handle in handles {
-    //         if let Err(e) = handle.await {
-    //             self.logger.log_error(&format!("Device patrol task failed: {}", e));
-    //         }
-    //     }
-    //     Ok(())
-    // }
 
     /// Enhanced single device patrol using shared buffer with jitter
     async fn run_single(
