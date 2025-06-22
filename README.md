@@ -23,7 +23,7 @@ A high-performance, multi-threaded disk health monitoring tool for Linux systems
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone and build
-git clone https://github.com/yourusername/disk-patrol.git
+git clone https://github.com/permezel/disk-patrol.git
 cd disk-patrol
 cargo build --release
 
@@ -49,7 +49,7 @@ disk_patrol --generate-config /etc/disk_patrol/config.toml
 
 2. Edit the configuration to specify your devices:
 ```bash
-sudo nano /etc/disk_patrol/config.toml
+sudo vi /etc/disk_patrol/config.toml
 ```
 
 3. Start patrolling:
@@ -273,16 +273,6 @@ cat /var/lib/disk_patrol/state.json | jq .
 sudo disk_patrol /dev/sda --verbose --period 1
 ```
 
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a pull request
-
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
@@ -298,8 +288,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [ ] SMART data integration
 - [ ] Prometheus metrics exporter
-- [ ] Web dashboard for status monitoring
-- [ ] Support for network-attached storage
-- [ ] Configurable read patterns (sequential, random)
-- [ ] Machine learning for failure prediction
-patrol read for hard drive health
