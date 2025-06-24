@@ -6,8 +6,6 @@
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +14,6 @@ use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
 use tokio::sync::Mutex;
 use tokio::time::interval;
-use indicatif::ProgressBar;
 
 use crate::SECTOR_SIZE;
 use crate::PatrolConfig;
@@ -24,6 +21,14 @@ use crate::device::DeviceInfo;
 use crate::device::PatrolError;
 use crate::SharedBuffer;
 use crate::logger::Logger;
+
+// Context struct to hold commonly passed parameters
+struct PatrolContext {
+    uniq: String,
+    device_path: PathBuf,
+    device_size: u64,
+    read_position: u64,
+}
 
 pub struct PatrolReader {
     pub config: PatrolConfig,
@@ -163,28 +168,6 @@ impl PatrolReader {
         Ok(())
     }
 
-    /// Calculate jittered timing: split the interval into random pre-sleep + post-sleep
-    fn calculate_jittered_timing(
-        base_interval_ms: u64,
-        max_jitter_percent: u8,
-        rng: &mut impl Rng
-    ) -> (u64, u64) {
-        let max_jitter_percent = max_jitter_percent.min(100) as f64 / 100.0;
-        let max_jitter_ms = (base_interval_ms as f64 * max_jitter_percent) as u64;
-
-        // Random jitter from 0 to max_jitter_ms
-        let total_jitter = rng.gen_range(0..=max_jitter_ms);
-
-        // Split the jitter randomly between pre and post
-        let pre_jitter = rng.gen_range(0..=total_jitter);
-        let post_jitter = total_jitter - pre_jitter;
-
-        // Base timing: start with some delay, then I/O, then remaining sleep
-        let base_post_sleep = base_interval_ms.saturating_sub(total_jitter);
-
-        (pre_jitter, base_post_sleep + post_jitter)
-    }
-
     pub async fn run(&self, seek: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Spawn individual patrol tasks for each device
         let mut handles = Vec::new();
@@ -208,27 +191,22 @@ impl PatrolReader {
         };
 
         for (uniq, device_path, size_bytes, last_position) in device_info_for_spawn {
-            let uniq_clone = uniq.clone();
-            let device_path_clone = device_path.clone();
             let device_states_clone = self.device_states.clone();
             let config_clone = self.config.clone();
             let logger_clone = self.logger.clone();
-            let progress_bars_clone = self.logger.progress_bars.clone();
             let shared_buffer_clone = self.shared_buffer.clone();
 
-            logger_clone.log_info(&format!("run {} size {:16x} seek {:16x}", device_path_clone.display(), size_bytes, last_position));
+            logger_clone.log_info(&format!("run {} size {:16x} seek {:16x}", device_path.display(), size_bytes, last_position));
+
             let handle = tokio::spawn(async move {
-                Self::run_single(
-                    uniq_clone,
-                    device_path_clone,
-                    size_bytes,
-                    last_position,
-                    device_states_clone,
-                    config_clone,
-                    logger_clone,
-                    progress_bars_clone,
-                    shared_buffer_clone,
-                ).await
+                let patrol_reader = Arc::new(PatrolReaderHandle {
+                    device_states: device_states_clone,
+                    config: config_clone,
+                    logger: logger_clone,
+                    shared_buffer: shared_buffer_clone,
+                });
+
+                patrol_reader.run_single(uniq, device_path, size_bytes, last_position).await
             });
 
             handles.push(handle);
@@ -236,7 +214,6 @@ impl PatrolReader {
 
         // Spawn periodic maintenance tasks
         let _state_saver_handle = self.spawn_periodic_tasks().await;
-        // handles.push(state_saver_handle);
 
         // Wait for all device patrols (they run forever)
         for handle in handles {
@@ -246,349 +223,6 @@ impl PatrolReader {
         }
 
         Ok(())
-    }
-
-    /// Enhanced single device patrol using shared buffer with jitter
-    async fn run_single(
-        uniq: String,
-        device_path: PathBuf,
-        device_size: u64,
-        mut read_position: u64,
-        device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
-        config: PatrolConfig,
-        logger: Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
-        shared_buffer: Arc<Mutex<SharedBuffer>>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-
-        // calculate optimal interval
-        let patrol_period_ms = 1000 * (config.patrol_period_days * 24 * 3600);
-        let total_reads = (device_size + config.read_size - 1) / config.read_size;
-        let optimal_sleep_ms = (patrol_period_ms / total_reads.max(1)).max(1);
-        let jitter_info = if config.enable_jitter {
-            format!(" (±{}% jitter)", config.max_jitter_percent)
-        } else {
-            String::new()
-        };
-
-        logger.log_info(&format!(
-            "Device {:?}-{}: {} reads over {}d = {}ms intervals{}",
-            device_path, uniq,
-            total_reads,
-            config.patrol_period_days,
-            optimal_sleep_ms,
-            jitter_info
-        ));
-
-        // Create a Send-safe RNG seeded from entropy
-        //let mut rng = StdRng::from_entropy();
-        let mut rng = SmallRng::from_entropy();
-
-        loop {
-            let start_time = tokio::time::Instant::now();
-
-            // Calculate jittered timing for this iteration
-            let (pre_sleep_ms, post_sleep_ms) = if config.enable_jitter {
-                Self::calculate_jittered_timing(optimal_sleep_ms, config.max_jitter_percent, &mut rng)
-            } else {
-                (0, optimal_sleep_ms)
-            };
-
-            // Random pre-sleep (jitter the start time)
-            if pre_sleep_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(pre_sleep_ms)).await;
-            }
-
-            // Perform the I/O operation
-            let io_start = tokio::time::Instant::now();
-            if let Err(e) = Self::patrol_device(
-                device_states.clone(),
-                config.clone(),
-                logger.clone(),
-                progress_bars.clone(),
-                shared_buffer.clone(),
-                device_path.clone(),
-                &uniq,
-                device_size,
-                read_position,
-                config.read_size,
-            ).await {
-                logger.log_error(&format!("Error patrolling {:?}: {}", device_path, e));
-            }
-            read_position += config.read_size;
-            let io_duration = io_start.elapsed();
-
-            // Calculate remaining sleep time, accounting for actual I/O duration
-            let total_elapsed = start_time.elapsed().as_millis() as u64;
-            let target_total_time = if config.enable_jitter {
-                pre_sleep_ms + post_sleep_ms
-            } else {
-                optimal_sleep_ms
-            };
-
-            if total_elapsed < target_total_time {
-                let remaining_sleep = target_total_time - total_elapsed;
-                tokio::time::sleep(Duration::from_millis(remaining_sleep)).await;
-            }
-
-            if config.verbose && config.enable_jitter {
-                logger.log_info(&format!(
-                    "Device {:?}: pre={}ms, I/O={}ms, post={}ms, total={}ms",
-                    device_path.file_name().unwrap_or_default().to_string_lossy(),
-                    pre_sleep_ms,
-                    io_duration.as_millis(),
-                    if total_elapsed < target_total_time { target_total_time - total_elapsed } else { 0 },
-                    start_time.elapsed().as_millis()
-                ));
-            }
-        }
-    }
-
-    async fn patrol_device(
-        device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
-        config: PatrolConfig,
-        logger: Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
-        shared_buffer: Arc<Mutex<SharedBuffer>>,
-        device_path: PathBuf,
-        uniq: &String,
-        device_size: u64,
-        read_position: u64,
-        read_size: u64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-
-        // Perform the read with the shared buffer
-        match Self::read_device_chunk(
-            &device_path,
-            read_position,
-            read_size,
-            shared_buffer
-        ).await {
-            Ok(_) => {
-                // Successful read - update state and progress
-                Self::update_device_state_after_read(
-                    device_states,
-                    &device_path, uniq,
-                    device_size,
-                    &config,
-                    &logger,
-                    progress_bars,
-                    read_position + read_size,
-                ).await?;
-
-                if config.verbose {
-                    let sector_start = read_position / SECTOR_SIZE;
-                    let sector_end = (read_position + read_size - 1) / SECTOR_SIZE;
-                    logger.log_info(&format!("✓ Read sectors {:x}-{:x} from {:?}-{}",
-                                           sector_start, sector_end, device_path, uniq));
-                }
-            }
-            Err(e) => {
-                // Handle read error
-                Self::handle_read_error(
-                    device_states,
-                    &device_path,
-                    uniq,
-                    device_size,
-                    &config,
-                    &logger,
-                    progress_bars,
-                    read_position,
-                    e,
-                ).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Update device state after successful read (same as before)
-    async fn update_device_state_after_read(
-        device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
-        device_path: &Path,
-        uniq: &String,
-        device_size: u64,
-        config: &PatrolConfig,
-        logger: &Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
-        read_position: u64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut states = device_states.lock().await;
-        if let Some(device_info) = states.get_mut(uniq) {
-            device_info.last_position = read_position;
-
-            // Update progress bar
-            if config.show_progress {
-                let progress_bars = progress_bars.lock().await;
-                if let Some(pb) = progress_bars.get(uniq) {
-                    let progress_pct = (read_position as f64 / device_size as f64) * 100.0;
-                    if config.debug {
-                        logger.progress_msg(&pb, uniq, device_info,
-                                            format!("{:4.1}% {:16x} {} {}",
-                                                    progress_pct, read_position / SECTOR_SIZE,
-                                                    device_path.display(), uniq));
-                    } else {
-                        logger.progress_msg(&pb, uniq, device_info, format!("{:4.1}% {:16x}",
-                                                                                   progress_pct, read_position));
-                    }
-                }
-            }
-
-            // Check if patrol cycle is complete
-            if device_info.last_position >= device_size {
-                device_info.last_position = 0;
-                device_info.patrol_start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-
-                logger.log_info(&format!("✅ Completed full patrol of {:?}, restarting cycle", device_path));
-
-                // Reset progress bar
-                if config.show_progress {
-                    let progress_bars = progress_bars.lock().await;
-                    if let Some(pb) = progress_bars.get(uniq) {
-                        pb.set_position(0);
-                        logger.progress_msg(&pb, uniq, device_info, format!("Cycle complete! Restarting..."));
-                    }
-                }
-            }
-        } else {
-            panic!("missing device info for {:?}-{}", device_path, uniq);
-        }
-        Ok(())
-    }
-
-    /// Handle read errors (same as before)
-    async fn handle_read_error(
-        device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
-        device_path: &PathBuf,
-        uniq: &String,
-        _device_size: u64,
-        config: &PatrolConfig,
-        logger: &Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
-        read_position: u64,
-        error: std::io::Error,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let error_msg = format!("I/O Error reading {:?} at sector {:x}: {}",
-                               device_path, read_position / SECTOR_SIZE, error);
-        logger.log_error(&error_msg);
-
-        // Record error in device state
-        let mut states = device_states.lock().await;
-        if let Some(device_info) = states.get_mut(uniq) {
-            device_info.errors.push(PatrolError {
-                timestamp: now,
-                sector: read_position / SECTOR_SIZE,
-                error: error.to_string(),
-            });
-
-            // Update progress bar with error indicator
-            if config.show_progress {
-                let progress_bars = progress_bars.lock().await;
-                if let Some(pb) = progress_bars.get(uniq) {
-                    logger.progress_msg(&pb, uniq, device_info,
-                                      format!("❌ {} errors total", device_info.errors.len()));
-                }
-            }
-
-            // Still advance position to avoid getting stuck
-            device_info.last_position += config.read_size;
-        }
-        Ok(())
-    }
-
-    /// Read device chunk using the single shared buffer
-    async fn read_device_chunk(
-        device_path: &Path,
-        position: u64,
-        size: u64,
-        shared_buffer: Arc<Mutex<SharedBuffer>>,
-    ) -> Result<(), std::io::Error> {
-        let device_path = device_path.to_path_buf();
-
-        tokio::task::spawn_blocking(move || {
-            // Acquire the shared buffer lock - this is where serialization happens
-            let rt = tokio::runtime::Handle::current();
-            let mut buffer = rt.block_on(shared_buffer.lock());
-
-            if buffer.len() < size as usize {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Buffer size {} too small for read size {}", buffer.len(), size)
-                ));
-            }
-
-            // Open device with O_DIRECT on Linux, normally on other platforms
-            #[cfg(target_os = "linux")]
-            let mut file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&device_path)
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to open device '{}': {}", device_path.display(), e)
-                    )
-                })?;
-
-            #[cfg(not(target_os = "linux"))]
-            let mut file = {
-                let file = OpenOptions::new()
-                    .read(true)
-                    .open(&device_path)
-                    .map_err(|e| {
-                        std::io::Error::new(
-                            e.kind(),
-                            format!("Failed to open device '{}': {}", device_path.display(), e)
-                        )
-                    })?;
-
-                // On macOS, attempt to disable caching
-                #[cfg(target_os = "macos")]
-                {
-                    use std::os::unix::io::AsRawFd;
-                    use libc::{fcntl, F_NOCACHE, F_SETFL};
-
-                    let fd = file.as_raw_fd();
-                    unsafe {
-                        fcntl(fd, F_SETFL, F_NOCACHE);
-                    }
-                }
-
-                file
-            };
-
-            // Seek to position
-            file.seek(SeekFrom::Start(position))
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to seek to position {}: {}", position, e)
-                    )
-                })?;
-
-            // Read into the shared buffer
-            let buffer_slice = buffer.as_mut_slice();
-            let bytes_read = file.read(&mut buffer_slice[..size as usize])
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to read {} bytes at position {}: {}", size, position, e)
-                    )
-                })?;
-
-            // Verify we read the expected amount
-            if bytes_read < size as usize {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("Expected to read {} bytes, but only read {}", size, bytes_read)
-                ));
-            }
-
-            // Note: We don't need to copy data out since we're just checking for read errors
-            // The buffer content is discarded after this operation
-            Ok(())
-        }).await.unwrap()
     }
 
     /// Spawn periodic maintenance tasks (state saving, error checking)
@@ -613,11 +247,7 @@ impl PatrolReader {
 
                     _ = alert_interval.tick() => {
                         // Periodic error threshold checking
-                        if let Err(e) = Self::check_error_alerts(
-                            device_states.clone(),
-                            config.clone(),
-                            logger.clone(),
-                        ).await {
+                        if let Err(e) = Self::check_error_alerts(&device_states, &config, &logger).await {
                             logger.log_error(&format!("Error checking alerts: {}", e));
                         }
                     }
@@ -628,9 +258,9 @@ impl PatrolReader {
 
     /// Static version of check_error_alerts for use in spawned tasks
     async fn check_error_alerts(
-        device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
-        config: PatrolConfig,
-        logger: Arc<Logger>,
+        device_states: &Arc<Mutex<HashMap<String, DeviceInfo>>>,
+        config: &PatrolConfig,
+        logger: &Arc<Logger>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut states = device_states.lock().await;
 
@@ -667,6 +297,7 @@ impl PatrolReader {
         tokio::fs::write(state_file, content).await?;
         Ok(())
     }
+
     /// Reset device state (for --reset option)
     pub async fn reset_device_state(&self, reset_all: bool, specific_devices: &[PathBuf]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut states = self.device_states.lock().await;
@@ -718,4 +349,331 @@ impl PatrolReader {
         }
         self.logger.send_email_alert(subject, body).await
     }
+}
+
+// Separate struct to handle patrol operations with reduced parameter passing
+struct PatrolReaderHandle {
+    device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
+    config: PatrolConfig,
+    logger: Arc<Logger>,
+    shared_buffer: Arc<Mutex<SharedBuffer>>,
+}
+
+impl PatrolReaderHandle {
+    /// Enhanced single device patrol using shared buffer with jitter
+    async fn run_single(
+        &self,
+        uniq: String,
+        device_path: PathBuf,
+        device_size: u64,
+        mut read_position: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
+        // calculate optimal interval
+        let patrol_period_ms = 1000 * (self.config.patrol_period_days * 24 * 3600);
+        let total_reads = (device_size + self.config.read_size - 1) / self.config.read_size;
+        let optimal_sleep_ms = (patrol_period_ms / total_reads.max(1)).max(1);
+        let jitter_info = if self.config.enable_jitter {
+            format!(" (±{}% jitter)", self.config.max_jitter_percent)
+        } else {
+            String::new()
+        };
+
+        self.logger.log_info(&format!(
+            "Device {:?}-{}: {} reads over {}d = {}ms intervals{}",
+            device_path, uniq,
+            total_reads,
+            self.config.patrol_period_days,
+            optimal_sleep_ms,
+            jitter_info
+        ));
+
+        // Create a Send-safe RNG seeded from entropy
+        let mut rng = SmallRng::from_entropy();
+
+        loop {
+            let start_time = tokio::time::Instant::now();
+
+            // Calculate jittered timing for this iteration
+            let (pre_sleep_ms, post_sleep_ms) = if self.config.enable_jitter {
+                calculate_jittered_timing(optimal_sleep_ms, self.config.max_jitter_percent, &mut rng)
+            } else {
+                (0, optimal_sleep_ms)
+            };
+
+            // Random pre-sleep (jitter the start time)
+            if pre_sleep_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(pre_sleep_ms)).await;
+            }
+
+            // Perform the I/O operation
+            let io_start = tokio::time::Instant::now();
+            let ctx = PatrolContext {
+                uniq: uniq.clone(),
+                device_path: device_path.clone(),
+                device_size,
+                read_position,
+            };
+
+            if let Err(e) = self.patrol_device(&ctx).await {
+                self.logger.log_error(&format!("Error patrolling {:?}: {}", device_path, e));
+            }
+            read_position += self.config.read_size;
+            let io_duration = io_start.elapsed();
+
+            // Calculate remaining sleep time, accounting for actual I/O duration
+            let total_elapsed = start_time.elapsed().as_millis() as u64;
+            let target_total_time = if self.config.enable_jitter {
+                pre_sleep_ms + post_sleep_ms
+            } else {
+                optimal_sleep_ms
+            };
+
+            if total_elapsed < target_total_time {
+                let remaining_sleep = target_total_time - total_elapsed;
+                tokio::time::sleep(Duration::from_millis(remaining_sleep)).await;
+            }
+
+            if self.config.verbose && self.config.enable_jitter {
+                self.logger.log_info(&format!(
+                    "Device {:?}: pre={}ms, I/O={}ms, post={}ms, total={}ms",
+                    device_path.file_name().unwrap_or_default().to_string_lossy(),
+                    pre_sleep_ms,
+                    io_duration.as_millis(),
+                    if total_elapsed < target_total_time { target_total_time - total_elapsed } else { 0 },
+                    start_time.elapsed().as_millis()
+                ));
+            }
+        }
+    }
+
+    async fn patrol_device(
+        &self,
+        ctx: &PatrolContext,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+
+        // Perform the read with the shared buffer
+        match self.read_device_chunk(&ctx.device_path, ctx.read_position).await {
+            Ok(_) => {
+                // Successful read - update state and progress
+                self.update_device_state_after_read(ctx, ctx.read_position + self.config.read_size).await?;
+
+                if self.config.verbose {
+                    let sector_start = ctx.read_position / SECTOR_SIZE;
+                    let sector_end = (ctx.read_position + self.config.read_size - 1) / SECTOR_SIZE;
+                    self.logger.log_info(&format!("✓ Read sectors {:x}-{:x} from {:?}-{}",
+                                           sector_start, sector_end, ctx.device_path, ctx.uniq));
+                }
+            }
+            Err(e) => {
+                // Handle read error
+                self.handle_read_error(ctx, e).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update device state after successful read
+    async fn update_device_state_after_read(
+        &self,
+        ctx: &PatrolContext,
+        new_position: u64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut states = self.device_states.lock().await;
+        if let Some(device_info) = states.get_mut(&ctx.uniq) {
+            device_info.last_position = new_position;
+
+            // Update progress bar
+            if self.config.show_progress {
+                let progress_bars = self.logger.progress_bars.lock().await;
+                if let Some(pb) = progress_bars.get(&ctx.uniq) {
+                    let progress_pct = (new_position as f64 / ctx.device_size as f64) * 100.0;
+                    if self.config.debug {
+                        self.logger.progress_msg(&pb, &ctx.uniq, device_info,
+                                            format!("{:4.1}% {:16x} {} {}",
+                                                    progress_pct, new_position / SECTOR_SIZE,
+                                                    ctx.device_path.display(), ctx.uniq));
+                    } else {
+                        self.logger.progress_msg(&pb, &ctx.uniq, device_info, format!("{:4.1}% {:16x}",
+                                                                                   progress_pct, new_position));
+                    }
+                }
+            }
+
+            // Check if patrol cycle is complete
+            if device_info.last_position >= ctx.device_size {
+                device_info.last_position = 0;
+                device_info.patrol_start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+                self.logger.log_info(&format!("✅ Completed full patrol of {:?}, restarting cycle", ctx.device_path));
+
+                // Reset progress bar
+                if self.config.show_progress {
+                    let progress_bars = self.logger.progress_bars.lock().await;
+                    if let Some(pb) = progress_bars.get(&ctx.uniq) {
+                        pb.set_position(0);
+                        self.logger.progress_msg(&pb, &ctx.uniq, device_info, format!("Cycle complete! Restarting..."));
+                    }
+                }
+            }
+        } else {
+            panic!("missing device info for {:?}-{}", ctx.device_path, ctx.uniq);
+        }
+        Ok(())
+    }
+
+    /// Handle read errors
+    async fn handle_read_error(
+        &self,
+        ctx: &PatrolContext,
+        error: std::io::Error,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let error_msg = format!("I/O Error reading {:?} at sector {:x}: {}",
+                               ctx.device_path, ctx.read_position / SECTOR_SIZE, error);
+        self.logger.log_error(&error_msg);
+
+        // Record error in device state
+        let mut states = self.device_states.lock().await;
+        if let Some(device_info) = states.get_mut(&ctx.uniq) {
+            device_info.errors.push(PatrolError {
+                timestamp: now,
+                sector: ctx.read_position / SECTOR_SIZE,
+                error: error.to_string(),
+            });
+
+            // Update progress bar with error indicator
+            if self.config.show_progress {
+                let progress_bars = self.logger.progress_bars.lock().await;
+                if let Some(pb) = progress_bars.get(&ctx.uniq) {
+                    self.logger.progress_msg(&pb, &ctx.uniq, device_info,
+                                      format!("❌ {} errors total", device_info.errors.len()));
+                }
+            }
+
+            // Still advance position to avoid getting stuck
+            device_info.last_position += self.config.read_size;
+        }
+        Ok(())
+    }
+
+    /// Read device chunk using the single shared buffer
+    async fn read_device_chunk(
+        &self,
+        device_path: &Path,
+        position: u64,
+    ) -> Result<(), std::io::Error> {
+        let device_path = device_path.to_path_buf();
+        let read_size = self.config.read_size;
+        let shared_buffer = self.shared_buffer.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // Acquire the shared buffer lock - this is where serialization happens
+            let rt = tokio::runtime::Handle::current();
+            let mut buffer = rt.block_on(shared_buffer.lock());
+
+            if buffer.len() < read_size as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("Buffer size {} too small for read size {}", buffer.len(), read_size)
+                ));
+            }
+
+            // Open device with O_DIRECT on Linux, normally on other platforms
+            #[cfg(target_os = "linux")]
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(target_os = "linux")]
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&device_path)
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to open device '{}': {}", device_path.display(), e)
+                    )
+                })?;
+
+            #[cfg(not(target_os = "linux"))]
+            let mut file = {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .open(&device_path)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to open device '{}': {}", device_path.display(), e)
+                        )
+                    })?;
+
+                // On macOS, attempt to disable caching
+                #[cfg(target_os = "macos")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    use libc::{fcntl, F_NOCACHE, F_SETFL};
+
+                    let fd = file.as_raw_fd();
+                    unsafe {
+                        fcntl(fd, F_SETFL, F_NOCACHE);
+                    }
+                }
+
+                file
+            };
+
+            // Seek to position
+            file.seek(SeekFrom::Start(position))
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to seek to position {}: {}", position, e)
+                    )
+                })?;
+
+            // Read into the shared buffer
+            let buffer_slice = buffer.as_mut_slice();
+            let bytes_read = file.read(&mut buffer_slice[..read_size as usize])
+                .map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read {} bytes at position {}: {}", read_size, position, e)
+                    )
+                })?;
+
+            // Verify we read the expected amount
+            if bytes_read < read_size as usize {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("Expected to read {} bytes, but only read {}", read_size, bytes_read)
+                ));
+            }
+
+            // Note: We don't need to copy data out since we're just checking for read errors
+            // The buffer content is discarded after this operation
+            Ok(())
+        }).await.unwrap()
+    }
+}
+
+/// Calculate jittered timing: split the interval into random pre-sleep + post-sleep
+fn calculate_jittered_timing(
+    base_interval_ms: u64,
+    max_jitter_percent: u8,
+    rng: &mut impl Rng
+) -> (u64, u64) {
+    let max_jitter_percent = max_jitter_percent.min(100) as f64 / 100.0;
+    let max_jitter_ms = (base_interval_ms as f64 * max_jitter_percent) as u64;
+
+    // Random jitter from 0 to max_jitter_ms
+    let total_jitter = rng.gen_range(0..=max_jitter_ms);
+
+    // Split the jitter randomly between pre and post
+    let pre_jitter = rng.gen_range(0..=total_jitter);
+    let post_jitter = total_jitter - pre_jitter;
+
+    // Base timing: start with some delay, then I/O, then remaining sleep
+    let base_post_sleep = base_interval_ms.saturating_sub(total_jitter);
+
+    (pre_jitter, base_post_sleep + post_jitter)
 }

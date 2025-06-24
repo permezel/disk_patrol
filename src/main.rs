@@ -4,8 +4,6 @@
 //#![allow(unused_mut)]
 //#![allow(deprecated)]
 
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use disk_patrol::{ConfigBuilder, generate_example_config, DEFAULT_CONFIG_PATH};
