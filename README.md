@@ -103,35 +103,46 @@ max_jitter_percent = 25
 disk_patrol [OPTIONS] [DEVICES]...
 
 OPTIONS:
-    -c, --config <FILE>              Configuration file path [default: /etc/disk_patrol/config.toml]
-    -p, --period <DAYS>              Patrol period in days [default: 30]
-    -r, --read-size <BYTES>          Read size per operation [default: 8MB]
-    -s, --state-file <FILE>          State file path [default: /var/lib/disk_patrol/state.json]
-    -v, --verbose                    Enable verbose output
-        --status                     Show patrol status and exit
-        --reset                      Reset patrol state for specified devices
-        --reset-all                  Reset state for all devices
-        --generate-config <FILE>     Generate example configuration file
-        --merge-config               Merge config file with command line args
-        --test-email                 Send test email and exit
-        --progress                   Show progress bars
-        --enable-jitter              Enable timing jitter
-        --max-jitter <PERCENT>       Maximum jitter percentage [default: 25]
+  -c, --config <FILE>               Configuration file path (TOML format) [default: /etc/disk_patrol/config.toml]
+      --generate-config [<FILE>]    Generate example configuration file (defaults to /etc/disk_patrol/config.toml)
+      --merge-config                Merge configuration file with command line and exit
+      --reset                       Reset device state
+      --reset-all                   Reset state for all devices
+  -p, --period <DAYS>               Patrol period in days [default: 30]
+  -r, --read-size <BYTES>           Read size per operation [default: 8MB]
+      --seek <PERCENT>              Percentage to offset starting position [default: 0]
+  -s, --state-file <FILE>           State file path [default: /var/lib/disk_patrol/state.json]
+  -v, --verbose                     Verbose output
+      --no-verbose                  Disable verbose output
+  -d, --debug                       Debug output
+      --no-debug                    Disable debug output
+      --status                      Show status and exit
+      --error-threshold <COUNT>     Number of errors before sending alert [default: 5]
+      --progress                    Show progress bars for each device
+      --no-progress                 Disable progress bars
+      --min-sleep <SECONDS>         Minimum sleep interval between reads [default: 5]
+      --max-sleep <SECONDS>         Maximum sleep interval between reads [default: 300]
+      --enable-jitter               Enable random timing jitter to spread I/O operations
+      --max-jitter <PERCENT>        Maximum jitter as percentage of sleep interval (0-100) [default: 25]
+  -h, --help                        Print help
+  -V, --version                     Print version
 
 LOGGING:
-        --syslog                     Enable syslog logging
-        --syslog-facility <FACILITY> Syslog facility [default: daemon]
+      --syslog                      Enable syslog logging
+      --no-syslog                   Disable syslog logging
+      --syslog-facility <FACILITY>  Syslog facility (daemon, user, local0-local7) [default: daemon]
 
 EMAIL ALERTS:
-        --email-alerts               Enable email alerts
-        --smtp-server <SERVER>       SMTP server hostname
-        --smtp-port <PORT>           SMTP server port [default: 587]
-        --smtp-starttls              Use STARTTLS
-        --smtp-username <USERNAME>   SMTP username
-        --smtp-password <PASSWORD>   SMTP password
-        --alert-from <EMAIL>         Alert sender address
-        --alert-to <EMAIL>           Alert recipient (can specify multiple)
-        --error-threshold <COUNT>    Errors before alert [default: 5]
+      --email-alerts                Enable email alerts
+      --no-email-alerts             Disable email alerts
+      --smtp-server <SERVER>        SMTP server hostname
+      --smtp-port <PORT>            SMTP server port [default: 587]
+      --smtp-starttls               Use STARTTLS for SMTP connection
+      --smtp-username <USERNAME>    SMTP username
+      --smtp-password <PASSWORD>    SMTP password
+      --alert-from <EMAIL>          Alert sender email address
+      --alert-to <EMAIL>            Alert recipient email address
+      --test-email                  Test email
 ```
 
 ## Usage Examples
