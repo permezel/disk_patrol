@@ -9,7 +9,7 @@ echo "Building disk_patrol for x86_64 Linux..."
 
 # Build static binary
 #cross build --target x86_64-unknown-linux-musl --release
-PKG_CONFIG_ALLOW_CROSS=1 cargo build --target x86_64-unknown-linux-musl --release
+cargo build --target x86_64-unknown-linux-musl --release
 
 # Copy to dist directory
 mkdir -p dist

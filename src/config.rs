@@ -6,6 +6,7 @@
 #![allow(deprecated)]
 */
 use clap::{Arg, ArgMatches, Command};
+use clap::parser::ValueSource;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::fs;
@@ -22,6 +23,7 @@ pub const DEFAULT_READ_SIZE: u64 = 8 * 1024 * 1024; // 8MB
 pub const DEFAULT_STATE_FILE: &str = "/var/lib/disk_patrol/state.json";
 pub const DEFAULT_LOG_FILE: &str = "/var/log/disk_patrol.log";
 pub const DEFAULT_VERBOSE: bool = false;
+pub const DEFAULT_DEBUG: bool = false;
 pub const DEFAULT_USE_SYSLOG: bool = true;
 pub const DEFAULT_SYSLOG_FACILITY: &str = "daemon";
 pub const DEFAULT_EMAIL_ALERTS: bool = true;
@@ -193,6 +195,55 @@ pub fn verify_config_paths(config: &PatrolConfig) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+
+/// Macro to check and override config values from command line
+macro_rules! override_if_present {
+    // For string values
+    ($matches:expr, $option:expr, $target:expr, string) => {
+        if $matches.value_source($option) == Some(ValueSource::CommandLine) {
+            if let Some(value) = $matches.get_one::<String>($option) {
+                $target = Some(value.to_string());
+            }
+        }
+    };
+
+    // For boolean flags
+    ($matches:expr, $option:expr, $target:expr, flag) => {
+        if $matches.value_source($option) == Some(ValueSource::CommandLine) {
+            $target = Some($matches.get_flag($option));
+        }
+    };
+
+    // For boolean flags with 'no-' version
+    ($matches:expr, $option:expr, $target:expr, flag-yn) => {
+        if $matches.value_source($option) == Some(ValueSource::CommandLine) {
+            $target = Some(true);
+        } else if $matches.value_source(concat!("no-", $option)) == Some(ValueSource::CommandLine) {
+            $target = Some(false);
+        }
+    };
+
+    // For Vec<String>
+    ($matches:expr, $option:expr, $target:expr, vec_string) => {
+        if $matches.value_source($option) == Some(ValueSource::CommandLine) {
+            if let Some(values) = $matches.get_many::<String>($option) {
+                $target = Some(values.map(|s| s.to_string()).collect());
+            }
+        }
+    };
+
+    // For parsed values
+    ($matches:expr, $option:expr, $target:expr, $type:ty) => {
+        if $matches.value_source($option) == Some(ValueSource::CommandLine) {
+            if let Some(value) = $matches.get_one::<String>($option) {
+                if let Ok(parsed) = value.parse::<$type>() {
+                    $target = Some(parsed);
+                }
+            }
+        }
+    };
+}
+
 /// Configuration file structure for TOML parsing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
@@ -202,6 +253,7 @@ pub struct ConfigFile {
     pub state_file: Option<String>,
     pub log_file: Option<String>,
     pub verbose: Option<bool>,
+    pub debug: Option<bool>,
     pub use_syslog: Option<bool>,
     pub syslog_facility: Option<String>,
     pub email_alerts: Option<bool>,
@@ -229,6 +281,7 @@ impl Default for ConfigFile {
             state_file: Some(DEFAULT_STATE_FILE.to_string()),
             log_file: Some(DEFAULT_LOG_FILE.to_string()),
             verbose: Some(DEFAULT_VERBOSE),
+            debug: Some(DEFAULT_DEBUG),
             use_syslog: Some(DEFAULT_USE_SYSLOG),
             syslog_facility: Some(DEFAULT_SYSLOG_FACILITY.to_string()),
             email_alerts: Some(DEFAULT_EMAIL_ALERTS),
@@ -258,6 +311,7 @@ pub struct PatrolConfig {
     pub state_file: PathBuf,
     pub log_file: Option<PathBuf>,
     pub verbose: bool,
+    pub debug: bool,
     pub use_syslog: bool,
     pub syslog_facility: String,
     pub email_alerts: bool,
@@ -306,119 +360,36 @@ impl ConfigBuilder {
     pub fn merge_command_line(mut self, matches: &ArgMatches) -> Self {
         if let Some(file_config) = &mut self.config_file {
             // Override config file values with command line arguments if provided
-            if matches.contains_id("devices") {
-                if let Some(devices) = matches.get_many::<String>("devices") {
-                    file_config.devices = Some(devices.map(|s| s.to_string()).collect());
-                }
-            }
 
-            if matches.contains_id("period") {
-                if let Some(period) = matches.get_one::<String>("period") {
-                    file_config.patrol_period_days = Some(period.parse().unwrap_or(DEFAULT_PATROL_DAYS));
-                }
-            }
+            // String overrides
+            override_if_present!(matches, "read-size", file_config.read_size, string);
+            override_if_present!(matches, "state-file", file_config.state_file, string);
+            override_if_present!(matches, "syslog-facility", file_config.syslog_facility, string);
+            override_if_present!(matches, "smtp-server", file_config.smtp_server, string);
+            override_if_present!(matches, "smtp-username", file_config.smtp_username, string);
+            override_if_present!(matches, "smtp-password", file_config.smtp_password, string);
+            override_if_present!(matches, "alert-from", file_config.alert_from, string);
 
-            if matches.contains_id("read-size") {
-                if let Some(size) = matches.get_one::<String>("read-size") {
-                    file_config.read_size = Some(size.parse().unwrap_or(DEFAULT_READ_SIZE_STR.to_string()));
-                }
-            }
+            // Numeric overrides
+            override_if_present!(matches, "period", file_config.patrol_period_days, u64);
+            override_if_present!(matches, "smtp-port", file_config.smtp_port, u16);
+            override_if_present!(matches, "error-threshold", file_config.error_threshold, usize);
+            override_if_present!(matches, "min-sleep", file_config.min_sleep_seconds, u64);
+            override_if_present!(matches, "max-sleep", file_config.max_sleep_seconds, u64);
+            override_if_present!(matches, "max-jitter", file_config.max_jitter_percent, u8);
 
-            if matches.contains_id("state-file") {
-                if let Some(path) = matches.get_one::<String>("state-file") {
-                    file_config.state_file = Some(path.to_string());
-                }
-            }
+            // Boolean flags
+            override_if_present!(matches, "verbose", file_config.verbose, flag-yn);
+            override_if_present!(matches, "debug", file_config.debug, flag-yn);
+            override_if_present!(matches, "syslog", file_config.use_syslog, flag-yn);
+            override_if_present!(matches, "email-alerts", file_config.email_alerts, flag-yn);
+            override_if_present!(matches, "smtp-starttls", file_config.smtp_use_starttls, flag);
+            override_if_present!(matches, "progress", file_config.show_progress, flag-yn);
+            override_if_present!(matches, "enable-jitter", file_config.enable_jitter, flag);
 
-            if matches.get_flag("verbose") {
-                file_config.verbose = Some(true);
-            }
-
-            if matches.get_flag("syslog") {
-                file_config.use_syslog = Some(true);
-            }
-
-            if matches.contains_id("syslog-facility") {
-                if let Some(facility) = matches.get_one::<String>("syslog-facility") {
-                    file_config.syslog_facility = Some(facility.to_string());
-                }
-            }
-
-            if matches.get_flag("email-alerts") {
-                file_config.email_alerts = Some(true);
-            }
-
-            if matches.contains_id("smtp-server") {
-                if let Some(server) = matches.get_one::<String>("smtp-server") {
-                    file_config.smtp_server = Some(server.to_string());
-                }
-            }
-
-            if matches.contains_id("smtp-port") {
-                if let Some(port) = matches.get_one::<String>("smtp-port") {
-                    file_config.smtp_port = Some(port.parse().unwrap_or(25));
-                }
-            }
-
-            if matches.get_flag("smtp-starttls") {
-                file_config.smtp_use_starttls = Some(true);
-            }
-
-            if matches.contains_id("smtp-username") {
-                if let Some(username) = matches.get_one::<String>("smtp-username") {
-                    file_config.smtp_username = Some(username.to_string());
-                }
-            }
-
-            if matches.contains_id("smtp-password") {
-                if let Some(password) = matches.get_one::<String>("smtp-password") {
-                    file_config.smtp_password = Some(password.to_string());
-                }
-            }
-
-            if matches.contains_id("alert-from") {
-                if let Some(from) = matches.get_one::<String>("alert-from") {
-                    file_config.alert_from = Some(from.to_string());
-                }
-            }
-
-            if matches.contains_id("alert-to") {
-                if let Some(recipients) = matches.get_many::<String>("alert-to") {
-                    file_config.alert_to = Some(recipients.map(|s| s.to_string()).collect());
-                }
-            }
-
-            if matches.contains_id("error-threshold") {
-                if let Some(threshold) = matches.get_one::<String>("error-threshold") {
-                    file_config.error_threshold = Some(threshold.parse().unwrap_or(5));
-                }
-            }
-
-            if matches.get_flag("progress") {
-                file_config.show_progress = Some(true);
-            }
-
-            if matches.contains_id("min-sleep") {
-                if let Some(min) = matches.get_one::<String>("min-sleep") {
-                    file_config.min_sleep_seconds = Some(min.parse().unwrap_or(5));
-                }
-            }
-
-            if matches.contains_id("max-sleep") {
-                if let Some(max) = matches.get_one::<String>("max-sleep") {
-                    file_config.max_sleep_seconds = Some(max.parse().unwrap_or(300));
-                }
-            }
-
-            if matches.get_flag("enable-jitter") {
-                file_config.enable_jitter = Some(true);
-            }
-
-            if matches.contains_id("max-jitter") {
-                if let Some(jitter) = matches.get_one::<String>("max-jitter") {
-                    file_config.max_jitter_percent = Some(jitter.parse().unwrap_or(25));
-                }
-            }
+            // Vector overrides
+            override_if_present!(matches, "devices", file_config.devices, vec_string);
+            override_if_present!(matches, "alert-to", file_config.alert_to, vec_string);
         } else {
             // No config file, create one from command line args
             let mut file_config = ConfigFile::default();
@@ -441,6 +412,10 @@ impl ConfigBuilder {
 
             if matches.get_flag("verbose") {
                 file_config.verbose = Some(true);
+            }
+
+            if matches.get_flag("debug") {
+                file_config.debug = Some(true);
             }
 
             if matches.get_flag("syslog") {
@@ -517,7 +492,7 @@ impl ConfigBuilder {
         let file_config = self.config_file.unwrap_or_default();
 
         // Build PatrolConfig from file_config and defaults
-        Ok(PatrolConfig {
+        let config = PatrolConfig {
             devices: file_config.devices
                 .map(|d| d.into_iter().map(PathBuf::from).collect())
                 .unwrap_or_else(Vec::new),
@@ -528,6 +503,7 @@ impl ConfigBuilder {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_FILE)),
             log_file: file_config.log_file.map(PathBuf::from),
             verbose: file_config.verbose.unwrap_or(DEFAULT_VERBOSE),
+            debug: file_config.debug.unwrap_or(DEFAULT_DEBUG),
             use_syslog: file_config.use_syslog.unwrap_or(DEFAULT_USE_SYSLOG),
             syslog_facility: file_config.syslog_facility.unwrap_or_else(|| DEFAULT_SYSLOG_FACILITY.to_string()),
             email_alerts: file_config.email_alerts.unwrap_or(DEFAULT_EMAIL_ALERTS),
@@ -544,7 +520,13 @@ impl ConfigBuilder {
             max_sleep_seconds: file_config.max_sleep_seconds,
             enable_jitter: file_config.enable_jitter.unwrap_or(DEFAULT_ENABLE_JITTER),
             max_jitter_percent: file_config.max_jitter_percent.unwrap_or(DEFAULT_MAX_JITTER_PERCENT),
-        })
+        };
+
+        // Validate jitter percentage
+        if config.max_jitter_percent > 100 {
+            return Err("Jitter percentage cannot exceed 100%".into());
+        }
+        Ok(config)
     }
 }
 
@@ -591,7 +573,7 @@ pub fn build_cli() -> Command {
         .arg(Arg::new("devices")
              .help("Block devices to patrol (e.g., /dev/sda /dev/nvme0n1)")
              .action(clap::ArgAction::Append)
-//             .required_unless_present_any(["config", "generate-config", "status", "reset", "reset-all"])
+             //             .required_unless_present_any(["config", "generate-config", "status", "reset", "reset-all"])
              .value_name("DEVICE"))
         .arg(Arg::new("config")
              .short('c')
@@ -602,7 +584,10 @@ pub fn build_cli() -> Command {
         .arg(Arg::new("generate-config")
              .long("generate-config")
              .value_name("FILE")
-             .help("Generate example configuration file and exit"))
+             .help(format!("Generate example configuration file (defaults to {})", DEFAULT_CONFIG_PATH))
+             .num_args(0..=1)  // Accept 0 or 1 argument
+             .default_missing_value(DEFAULT_CONFIG_PATH)  // Default when flag is used without value
+             .action(clap::ArgAction::Set))
         .arg(Arg::new("merge-config")
              .long("merge-config")
              .help("Merge configuration file with command line and exit")
@@ -627,6 +612,11 @@ pub fn build_cli() -> Command {
              .value_name("BYTES")
              .help("Read size per operation")
              .default_value(DEFAULT_READ_SIZE_STR))
+        .arg(Arg::new("seek")
+             .long("seek")
+             .value_name("PERCENT")
+             .help("Percentage to offset starting position")
+            .default_value("0"))
         .arg(Arg::new("state-file")
              .short('s')
              .long("state-file")
@@ -638,6 +628,21 @@ pub fn build_cli() -> Command {
              .long("verbose")
              .help("Verbose output")
              .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("no-verbose")
+             .long("no-verbose")
+             .help("Disable verbose output")
+             .action(clap::ArgAction::SetTrue)
+             .conflicts_with("verbose"))
+        .arg(Arg::new("debug")
+             .short('d')
+             .long("debug")
+             .help("Debug output")
+             .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("no-debug")
+             .long("no-debug")
+             .help("Disable debug output")
+             .conflicts_with("debug")
+             .action(clap::ArgAction::SetTrue))
         .arg(Arg::new("status")
              .long("status")
              .help("Show status and exit")
@@ -646,6 +651,11 @@ pub fn build_cli() -> Command {
              .long("syslog")
              .help("Enable syslog logging")
              .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("no-syslog")
+             .long("no-syslog")
+             .help("Disable syslog logging")
+             .action(clap::ArgAction::SetTrue)
+             .conflicts_with("syslog"))
         .arg(Arg::new("syslog-facility")
              .long("syslog-facility")
              .value_name("FACILITY")
@@ -655,6 +665,11 @@ pub fn build_cli() -> Command {
              .long("email-alerts")
              .help("Enable email alerts")
              .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("no-email-alerts")
+             .long("no-email-alerts")
+             .help("Disable email alerts")
+             .action(clap::ArgAction::SetTrue)
+             .conflicts_with("email-alerts"))
         .arg(Arg::new("smtp-server")
              .long("smtp-server")
              .value_name("SERVER")
@@ -698,6 +713,11 @@ pub fn build_cli() -> Command {
              .long("progress")
              .help("Show progress bars for each device")
              .action(clap::ArgAction::SetTrue))
+        .arg(Arg::new("no-progress")
+             .long("no-progress")
+             .help("Disable progress bars")
+             .action(clap::ArgAction::SetTrue)
+             .conflicts_with("progress"))
         .arg(Arg::new("min-sleep")
              .long("min-sleep")
              .value_name("SECONDS")
@@ -717,4 +737,370 @@ pub fn build_cli() -> Command {
              .value_name("PERCENT")
              .help("Maximum jitter as percentage of sleep interval (0-100)")
              .default_value(DEFAULT_MAX_JITTER_PERCENT_STR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Helper function to create a test config file
+    fn create_test_config_file(dir: &TempDir, content: &str) -> PathBuf {
+        let config_path = dir.path().join("test_config.toml");
+        fs::write(&config_path, content).unwrap();
+        config_path
+    }
+
+    /// Helper function to parse command line args
+    fn parse_args(args: Vec<&str>) -> ArgMatches {
+        let cmd = build_cli();
+        cmd.try_get_matches_from(args).unwrap()
+    }
+
+    #[test]
+    fn test_string_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            state_file = "/original/state.json"
+            smtp_server = "original.smtp.com"
+            smtp_username = "original_user"
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        // Test command line override
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "--state-file", "/new/state.json",
+            "--smtp-server", "new.smtp.com",
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.state_file, PathBuf::from("/new/state.json"));
+        assert_eq!(config.smtp_server, Some("new.smtp.com".to_string()));
+        // smtp_username should remain unchanged
+        assert_eq!(config.smtp_username, Some("original_user".to_string()));
+    }
+
+    #[test]
+    fn test_numeric_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            patrol_period_days = 30
+            smtp_port = 25
+            error_threshold = 5
+            max_jitter_percent = 10
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "--period", "60",
+            "--smtp-port", "587",
+            "--error-threshold", "10",
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.patrol_period_days, 60);
+        assert_eq!(config.smtp_port, 587);
+        assert_eq!(config.error_threshold, 10);
+        // max_jitter_percent should remain unchanged
+        assert_eq!(config.max_jitter_percent, 10);
+    }
+
+    #[test]
+    fn test_boolean_flag_override_true() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            verbose = false
+            email_alerts = false
+            show_progress = false
+            enable_jitter = true
+            debug = false
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "--verbose",
+            "--email-alerts",
+            "--progress",
+            "--debug",
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.verbose, true);
+        assert_eq!(config.email_alerts, true);
+        assert_eq!(config.show_progress, true);
+        // enable_jitter should remain unchanged
+        assert_eq!(config.enable_jitter, true);
+    }
+
+    #[test]
+    fn test_boolean_flag_override_false() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            verbose = true
+            email_alerts = true
+            show_progress = true
+            enable_jitter = true
+            debug = true
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "--no-verbose",
+            "--no-email-alerts",
+            "--no-progress",
+            "--no-debug",
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.verbose, false);
+        assert_eq!(config.email_alerts, false);
+        assert_eq!(config.show_progress, false);
+        // enable_jitter should remain unchanged
+        assert_eq!(config.enable_jitter, true);
+    }
+
+    #[test]
+    fn test_vec_string_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            devices = ["/dev/sda", "/dev/sdb"]
+            alert_to = ["admin@example.com"]
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "/dev/nvme0n1",
+            "/dev/nvme1n1",
+            "--alert-to", "ops@example.com",
+            "--alert-to", "security@example.com",
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.devices, vec![PathBuf::from("/dev/nvme0n1"), PathBuf::from("/dev/nvme1n1")]);
+        assert_eq!(config.alert_to, vec!["ops@example.com", "security@example.com"]);
+    }
+
+    #[test]
+    fn test_read_size_parsing() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            read_size = "4MB"
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "--read-size", "16MB",
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.read_size, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_no_config_file_with_cli_args() {
+        let args = vec![
+            "disk_patrol",
+            "/dev/sda",
+            "--period", "45",
+            "--verbose",
+            "--smtp-server", "test.smtp.com",
+            "--error-threshold", "3",
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.devices, vec![PathBuf::from("/dev/sda")]);
+        assert_eq!(config.patrol_period_days, 45);
+        assert_eq!(config.verbose, true);
+        assert_eq!(config.smtp_server, Some("test.smtp.com".to_string()));
+        assert_eq!(config.error_threshold, 3);
+    }
+
+    #[test]
+    fn test_mixed_overrides() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            devices = ["/dev/sda"]
+            patrol_period_days = 30
+            read_size = "4MB"
+            verbose = false
+            email_alerts = true
+            smtp_server = "config.smtp.com"
+            smtp_port = 25
+            error_threshold = 5
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "/dev/nvme0n1",  // Override devices
+            "--period", "60",  // Override period
+            "--verbose",  // Set verbose to true
+            "--no-email-alerts",  // Set email_alerts to false
+            "--smtp-port", "587",  // Override port
+            // Leave smtp_server and error_threshold unchanged
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        // Overridden values
+        assert_eq!(config.devices, vec![PathBuf::from("/dev/nvme0n1")]);
+        assert_eq!(config.patrol_period_days, 60);
+        assert_eq!(config.verbose, true);
+        assert_eq!(config.email_alerts, false);
+        assert_eq!(config.smtp_port, 587);
+
+        // Unchanged values
+        assert_eq!(config.read_size, 4 * 1024 * 1024);
+        assert_eq!(config.smtp_server, Some("config.smtp.com".to_string()));
+        assert_eq!(config.error_threshold, 5);
+    }
+
+    #[test]
+    fn test_optional_values_remain_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            # Minimal config with many optional values missing
+            devices = ["/dev/sda"]
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+        ];
+        let matches = parse_args(args);
+
+        let config = ConfigBuilder::new()
+            .load_config_file(config_path.to_str().unwrap())
+            .unwrap()
+            .merge_command_line(&matches)
+            .build()
+            .unwrap();
+
+        // These should use defaults when not specified
+        assert_eq!(config.patrol_period_days, DEFAULT_PATROL_DAYS);
+        assert_eq!(config.verbose, DEFAULT_VERBOSE);
+        assert_eq!(config.email_alerts, DEFAULT_EMAIL_ALERTS);
+
+        // Optional values that can be None
+        assert_eq!(config.log_file, None);
+        assert_eq!(config.min_sleep_seconds, None);
+        assert_eq!(config.max_sleep_seconds, None);
+    }
+
+    #[test]
+    fn test_parse_read_size_units() {
+        assert_eq!(parse_read_size("1024").unwrap(), 1024);
+        assert_eq!(parse_read_size("1K").unwrap(), 1024);
+        assert_eq!(parse_read_size("1KB").unwrap(), 1024);
+        assert_eq!(parse_read_size("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_read_size("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_read_size("8MB").unwrap(), 8 * 1024 * 1024);
+        assert_eq!(parse_read_size("  16KB  ").unwrap(), 16 * 1024);
+
+        // Test case insensitivity
+        assert_eq!(parse_read_size("1mb").unwrap(), 1024 * 1024);
+        assert_eq!(parse_read_size("1Mb").unwrap(), 1024 * 1024);
+    }
+
+    #[test]
+    fn test_value_source_detection() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_content = r#"
+            state_file = "/from/config.json"
+            verbose = true
+        "#;
+        let config_path = create_test_config_file(&temp_dir, config_content);
+
+        // Test 1: Value from config file only
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+        ];
+        let matches = parse_args(args);
+
+        // These should NOT have CommandLine as their source
+        assert_ne!(matches.value_source("state-file"), Some(ValueSource::CommandLine));
+        assert_ne!(matches.value_source("verbose"), Some(ValueSource::CommandLine));
+
+        // Test 2: Value from command line
+        let args = vec![
+            "disk_patrol",
+            "--config", config_path.to_str().unwrap(),
+            "--state-file", "/from/cli.json",
+            "--no-verbose",
+        ];
+        let matches = parse_args(args);
+
+        // These SHOULD have CommandLine as their source
+        assert_eq!(matches.value_source("state-file"), Some(ValueSource::CommandLine));
+        assert_eq!(matches.value_source("no-verbose"), Some(ValueSource::CommandLine));
+    }
 }

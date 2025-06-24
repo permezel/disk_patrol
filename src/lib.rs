@@ -8,3 +8,4 @@ pub use config::DEFAULT_CONFIG_PATH;
 
 pub mod device;
 pub use device::get_device_info;
+pub use device::verify_unique;

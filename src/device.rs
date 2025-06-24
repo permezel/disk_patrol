@@ -9,10 +9,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::io::{Seek, SeekFrom};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatrolError {
@@ -58,7 +58,6 @@ impl DeviceInfo {
     pub fn from_path(device_path: &Path) -> Result<DeviceInfo, Box<dyn std::error::Error + Send + Sync>> {
         let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECT)
             .open(device_path)?;
 
         // Get device size
@@ -79,7 +78,7 @@ impl DeviceInfo {
 
         let uniq = {
             if wwid.len() > 0 {
-                format!("wwn.{}", wwid)
+                format!("{}", wwid)
             } else if eui.len() > 0 {
                 format!("eui.{}", eui)
             } else if serial.len() > 0 {
@@ -108,4 +107,120 @@ impl DeviceInfo {
 
 pub async fn get_device_info(device_path: &Path) -> Result<DeviceInfo, Box<dyn std::error::Error + Send + Sync>> {
     DeviceInfo::from_path(device_path)
+}
+
+#[derive(Debug)]
+pub enum DeviceValidationError {
+    DuplicatePath { path: PathBuf, existing_device: String },
+    DuplicateSerial { serial: String, existing_device: String },
+    DuplicateWwid { wwid: String, existing_device: String },
+    DuplicateEui { eui: String, existing_device: String },
+    DuplicateUniq { uniq: String, existing_device: String },
+    Duplicates {},
+}
+
+impl std::fmt::Display for DeviceValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceValidationError::DuplicatePath { path, existing_device } => {
+                write!(f, "Duplicate path '{}' already used by device '{}'", path.display(), existing_device)
+            }
+            DeviceValidationError::DuplicateSerial { serial, existing_device } => {
+                write!(f, "Duplicate serial '{}' already used by device '{}'", serial, existing_device)
+            }
+            DeviceValidationError::DuplicateWwid { wwid, existing_device } => {
+                write!(f, "Duplicate WWID '{}' already used by device '{}'", wwid, existing_device)
+            }
+            DeviceValidationError::DuplicateEui { eui, existing_device } => {
+                write!(f, "Duplicate EUI '{}' already used by device '{}'", eui, existing_device)
+            }
+            DeviceValidationError::DuplicateUniq { uniq, existing_device } => {
+                write!(f, "Duplicate unique ID '{}' already used by device '{}'", uniq, existing_device)
+            }
+            DeviceValidationError::Duplicates {} => {
+                write!(f, "Duplicates exist in state file")
+
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeviceValidationError {}
+
+pub async fn verify_unique(states: &HashMap<String, DeviceInfo>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut errors = Vec::new();
+    let mut paths:   HashMap<PathBuf, String> = HashMap::new();
+    let mut serials: HashMap<String, String> = HashMap::new();
+    let mut wwids:   HashMap<String, String> = HashMap::new();
+    let mut euis:    HashMap<String, String> = HashMap::new();
+    let mut uniqs:   HashMap<String, String> = HashMap::new();
+
+    for (id, info) in states.iter() {
+        // Check path uniqueness
+        if let Some(existing) = paths.get(&info.path) {
+            errors.push(DeviceValidationError::DuplicatePath {
+                path: info.path.clone(),
+                existing_device: existing.clone(),
+            });
+        } else {
+            paths.insert(info.path.clone(), id.clone());
+        }
+
+        // Check serial uniqueness (skip if empty)
+        if !info.serial.is_empty() {
+            if let Some(existing) = serials.get(&info.serial) {
+                errors.push(DeviceValidationError::DuplicateSerial {
+                    serial: info.serial.clone(),
+                    existing_device: existing.clone(),
+                });
+            } else {
+                serials.insert(info.serial.clone(), id.clone());
+            }
+        }
+
+        // Check WWID uniqueness (skip if empty)
+        if !info.wwid.is_empty() {
+            if let Some(existing) = wwids.get(&info.wwid) {
+                errors.push(DeviceValidationError::DuplicateWwid {
+                    wwid: info.wwid.clone(),
+                    existing_device: existing.clone(),
+                });
+            } else {
+                wwids.insert(info.wwid.clone(), id.clone());
+            }
+        }
+
+        // Check EUI uniqueness (skip if empty)
+        if !info.eui.is_empty() {
+            if let Some(existing) = euis.get(&info.eui) {
+                errors.push(DeviceValidationError::DuplicateEui {
+                    eui: info.eui.clone(),
+                    existing_device: existing.clone(),
+                });
+            } else {
+                euis.insert(info.eui.clone(), id.clone());
+            }
+        }
+
+        // Check unique ID uniqueness (skip if empty)
+        if !info.uniq.is_empty() {
+            if let Some(existing) = uniqs.get(&info.uniq) {
+                errors.push(DeviceValidationError::DuplicateUniq {
+                    uniq: info.uniq.clone(),
+                    existing_device: existing.clone(),
+                });
+            } else {
+                uniqs.insert(info.uniq.clone(), id.clone());
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        for e in errors {
+            eprintln!("{}", e);
+        }
+        Err(Box::new(DeviceValidationError::Duplicates {  }))
+    }
 }

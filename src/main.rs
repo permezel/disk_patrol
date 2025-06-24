@@ -6,8 +6,9 @@
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::alloc::{alloc, dealloc, Layout};
@@ -23,7 +24,6 @@ use log::{LevelFilter, info, warn, error};
 use lettre::{Message, SmtpTransport, Transport};
 use lettre::transport::smtp::authentication::Credentials;
 use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
-use std::fs;
 
 use disk_patrol::{ConfigBuilder, generate_example_config, SECTOR_SIZE, DEFAULT_CONFIG_PATH};
 use disk_patrol::PatrolConfig;
@@ -99,7 +99,7 @@ struct PatrolReader {
 
 struct Logger {
     config: PatrolConfig,
-    progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+    progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
     multi_progress: Arc<MultiProgress>,
 }
 
@@ -148,21 +148,23 @@ impl Logger {
     }
 
     fn log_info(&self, message: &str) {
-        if self.config.verbose {
-            //println!("INFO: {}", message);
+        if !self.config.show_progress && self.config.verbose {
+            println!("INFO: {}", message);
         }
 
         info!("{}", message);
     }
 
     fn log_error(&self, message: &str) {
-        eprintln!("ERROR: {}", message);
+        if !self.config.show_progress {
+            eprintln!("ERROR: {}", message);
+        }
 
         error!("{}", message);
     }
 
     fn log_warning(&self, message: &str) {
-        if self.config.verbose {
+        if !self.config.show_progress {
             println!("WARNING: {}", message);
         }
 
@@ -229,8 +231,8 @@ impl Logger {
         Ok(())
     }
 
-    fn progress_msg(&self, pb: &ProgressBar, device_path: &Path, device_info: &DeviceInfo, msg: String) {
-        let device_name = device_path.file_name()
+    fn progress_msg(&self, pb: &ProgressBar, _uniq: &String, device_info: &DeviceInfo, msg: String) {
+        let device_name = device_info.path.file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
@@ -244,7 +246,7 @@ impl Logger {
         pb.set_position(device_info.last_position / SECTOR_SIZE);
     }
 
-    async fn create_progress_bar(&self, device_path: &Path, device_info: &DeviceInfo) {
+    async fn create_progress_bar(&self, uniq: &String, device_info: &DeviceInfo) {
         let pb = self.multi_progress.add(ProgressBar::new(device_info.sectors));
 
         pb.set_style(
@@ -254,10 +256,10 @@ impl Logger {
                 .progress_chars("█▉▊▋▌▍▎▏  ")
         );
 
-        self.progress_msg(&pb, device_path, device_info, format!("- Starting patrol"));
+        self.progress_msg(&pb, uniq, device_info, format!("- Starting patrol at {:16x}", device_info.size_bytes / SECTOR_SIZE));
 
         let mut progress_bars = self.progress_bars.lock().await;
-        progress_bars.insert(device_path.to_path_buf(), pb);
+        progress_bars.insert(uniq.clone(), pb);
     }
 }
 
@@ -301,25 +303,16 @@ impl PatrolReader {
             }
         }
 
+        let mut new_devices = Vec::new();
+
         // sync device state
         for device_path in &self.config.devices {
-            // The config.devices[] name may change
             match self.get_device_info(device_path).await {
                 Ok(info) => {
-                    if self.config.show_progress {
-                        self.logger.create_progress_bar(device_path, &info).await;
-                    }
                     if !states.contains_key(&info.uniq) {
-                        self.logger.log_info(&format!("Initialized device: {:?} {} ({}TB)",
-                                                      device_path, info.uniq,
-                                                      info.size_bytes / (1024 * 1024 * 1024 * 1024)));
+                        new_devices.push(info.uniq.clone());
                         states.insert(info.uniq.clone(), info);
-                    } else {
-                        self.logger.log_info(&format!("Resuming device: {:?} {} ({}TB)",
-                                                      device_path, info.uniq,
-                                                      info.size_bytes / (1024 * 1024 * 1024 * 1024)));
                     }
-
                 },
 
                 Err(e) => {
@@ -330,6 +323,31 @@ impl PatrolReader {
         }
 
         self.save_state(&states).await?;
+
+        // verify that there are no aliases
+        match disk_patrol::device::verify_unique(&states).await {
+            Ok(_) => {},
+            Err(e) => {
+                dbg!(&e);
+                eprintln!("Duplicates exist.  Please fix {} first.", self.config.state_file.display());
+                return Err(e);
+            }
+        }
+
+        if self.config.show_progress {
+            for (id, info) in states.iter() {
+                self.logger.create_progress_bar(id, &info).await;
+                if new_devices.contains(&id) {
+                    self.logger.log_info(&format!("Resuming device: {:?} {} ({}TB)",
+                                                  info.path, info.uniq,
+                                                  info.size_bytes / (1024 * 1024 * 1024 * 1024)));
+                } else {
+                    self.logger.log_info(&format!("Initialized device: {:?} {} ({}TB)",
+                                                  info.path, info.uniq,
+                                                  info.size_bytes / (1024 * 1024 * 1024 * 1024)));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -363,6 +381,7 @@ impl PatrolReader {
             println!("  Size: {:.2} GB", info.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
             println!("  Progress: {:.1}%", progress);
             println!("  Errors: {}", error_count);
+            println!("  I/O segments: {:16x}", info.size_bytes / self.config.read_size);
 
             if error_count > 0 {
                 println!("  Recent errors:");
@@ -398,7 +417,7 @@ impl PatrolReader {
         (pre_jitter, base_post_sleep + post_jitter)
     }
 
-    async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn run(&self, seek: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Spawn individual patrol tasks for each device
         let mut handles = Vec::new();
 
@@ -406,11 +425,16 @@ impl PatrolReader {
         let device_info_for_spawn = {
             let states = self.device_states.lock().await;
             states.iter().map(|(uniq, info)| {
+                let pos = info.size_bytes / self.config.read_size;
+                let pos1 = seek as u64 * pos;
+                let pos2 = pos1 / 100;
+                let pos3 = pos2 * self.config.read_size;
+                println!("{:x} {:x} {:x} {:x} {:x} {:x}", pos, pos1, pos2, pos3, info.last_position, info.last_position.max(pos3));
                 (
                     uniq.clone(),
                     info.path.clone(),
                     info.size_bytes,
-                    info.last_position,
+                    info.last_position.max(pos3)
                 )
             }).collect::<Vec<_>>()
         };
@@ -424,6 +448,7 @@ impl PatrolReader {
             let progress_bars_clone = self.logger.progress_bars.clone();
             let shared_buffer_clone = self.shared_buffer.clone();
 
+            logger_clone.log_info(&format!("run {} size {:16x} seek {:16x}", device_path_clone.display(), size_bytes, last_position));
             let handle = tokio::spawn(async move {
                 Self::run_single(
                     uniq_clone,
@@ -464,7 +489,7 @@ impl PatrolReader {
         device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
         config: PatrolConfig,
         logger: Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
         shared_buffer: Arc<Mutex<SharedBuffer>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
@@ -555,7 +580,7 @@ impl PatrolReader {
         device_states: Arc<Mutex<HashMap<String, DeviceInfo>>>,
         config: PatrolConfig,
         logger: Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
         shared_buffer: Arc<Mutex<SharedBuffer>>,
         device_path: PathBuf,
         uniq: &String,
@@ -617,7 +642,7 @@ impl PatrolReader {
         device_size: u64,
         config: &PatrolConfig,
         logger: &Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
         read_position: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut states = device_states.lock().await;
@@ -627,9 +652,17 @@ impl PatrolReader {
             // Update progress bar
             if config.show_progress {
                 let progress_bars = progress_bars.lock().await;
-                if let Some(pb) = progress_bars.get(device_path) {
-                    let progress_pct = (device_info.last_position as f64 / device_size as f64) * 100.0;
-                    logger.progress_msg(&pb, device_path, device_info, format!("{:4.1}%", progress_pct));
+                if let Some(pb) = progress_bars.get(uniq) {
+                    let progress_pct = (read_position as f64 / device_size as f64) * 100.0;
+                    if config.debug {
+                        logger.progress_msg(&pb, uniq, device_info,
+                                            format!("{:4.1}% {:16x} {} {}",
+                                                    progress_pct, read_position / SECTOR_SIZE,
+                                                    device_path.display(), uniq));
+                    } else {
+                        logger.progress_msg(&pb, uniq, device_info, format!("{:4.1}% {:16x}",
+                                                                                   progress_pct, read_position));
+                    }
                 }
             }
 
@@ -643,9 +676,9 @@ impl PatrolReader {
                 // Reset progress bar
                 if config.show_progress {
                     let progress_bars = progress_bars.lock().await;
-                    if let Some(pb) = progress_bars.get(device_path) {
+                    if let Some(pb) = progress_bars.get(uniq) {
                         pb.set_position(0);
-                        logger.progress_msg(&pb, device_path, device_info, format!("Cycle complete! Restarting..."));
+                        logger.progress_msg(&pb, uniq, device_info, format!("Cycle complete! Restarting..."));
                     }
                 }
             }
@@ -663,7 +696,7 @@ impl PatrolReader {
         _device_size: u64,
         config: &PatrolConfig,
         logger: &Arc<Logger>,
-        progress_bars: Arc<Mutex<HashMap<PathBuf, ProgressBar>>>,
+        progress_bars: Arc<Mutex<HashMap<String, ProgressBar>>>,
         read_position: u64,
         error: std::io::Error,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -684,8 +717,8 @@ impl PatrolReader {
             // Update progress bar with error indicator
             if config.show_progress {
                 let progress_bars = progress_bars.lock().await;
-                if let Some(pb) = progress_bars.get(device_path) {
-                    logger.progress_msg(&pb, device_path, device_info,
+                if let Some(pb) = progress_bars.get(uniq) {
+                    logger.progress_msg(&pb, uniq, device_info,
                                       format!("❌ {} errors total", device_info.errors.len()));
                 }
             }
@@ -717,7 +750,8 @@ impl PatrolReader {
                 ));
             }
 
-            // Open device with O_DIRECT
+            // Open device with O_DIRECT on Linux, normally on other platforms
+            #[cfg(target_os = "linux")]
             let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECT)
@@ -728,6 +762,33 @@ impl PatrolReader {
                         format!("Failed to open device '{}': {}", device_path.display(), e)
                     )
                 })?;
+
+            #[cfg(not(target_os = "linux"))]
+            let mut file = {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .open(&device_path)
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to open device '{}': {}", device_path.display(), e)
+                        )
+                    })?;
+
+                // On macOS, attempt to disable caching
+                #[cfg(target_os = "macos")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    use libc::{fcntl, F_NOCACHE, F_SETFL};
+
+                    let fd = file.as_raw_fd();
+                    unsafe {
+                        fcntl(fd, F_SETFL, F_NOCACHE);
+                    }
+                }
+
+                file
+            };
 
             // Seek to position
             file.seek(SeekFrom::Start(position))
@@ -891,11 +952,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let matches = build_cli().get_matches();
 
     // Handle config file generation
-    if let Some(config_path) = matches.get_one::<String>("generate-config") {
+    if let Some(path) = matches.get_one::<String>("generate-config") {
         let example_config = generate_example_config()?;
-        fs::write(config_path, example_config)?;
-        println!("Generated example configuration file: {}", config_path);
-        println!("\nEdit the file and run with: disk_patrol --config {}", config_path);
+        let path = Path::new(path);
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
+            }
+        }
+
+        // Write the config file
+        std::fs::write(path, example_config)
+            .map_err(|e| format!("Failed to write config file {}: {}", path.display(), e))?;
+
+        println!("Generated example configuration file: {}", path.display());
+        println!("Edit this file to configure your devices and settings.");
+
         return Ok(());
     }
 
@@ -908,27 +983,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("Loaded configuration from: {}", config_path);
     }
 
-    let config = config_builder
-        .merge_command_line(&matches)
-        .build()?;
-
-    verify_config_paths(&config)?;
-
-    // Validate jitter percentage
-    if config.max_jitter_percent > 100 {
-        return Err("Jitter percentage cannot exceed 100%".into());
-    }
-
     if matches.get_flag("merge-config") {
         let path = if let Some(config_path) = matches.get_one::<String>("config") {
             config_path
         } else {
             &DEFAULT_CONFIG_PATH.to_string()
         };
-        let config_builder = ConfigBuilder::new();
         config_builder.merge_command_line(&matches).save_config_file(path)?;
         return Ok(());
     }
+
+    let config = config_builder
+        .merge_command_line(&matches)
+        .build()?;
+
+    verify_config_paths(&config)?;
 
     let patrol_reader = PatrolReader::new(config)?;
 
@@ -963,7 +1032,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if matches.get_flag("status") {
         patrol_reader.print_status().await?;
     } else {
-        patrol_reader.run().await?;
+        let mut seek = 0u8;
+
+        if let Some(arg) = matches.get_one::<String>("seek") {
+            seek = arg.parse()?;
+            if seek >= 100 {
+                eprintln!("seek must be within [0-100)");
+                std::process::exit(1);
+            }
+        }
+        patrol_reader.run(seek).await?;
     }
 
     Ok(())
